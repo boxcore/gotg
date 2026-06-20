@@ -1,0 +1,98 @@
+# Gotg
+
+`gotg` 是一个轻量级、高性能的 Telegram Bot 运维及媒体辅助工具，旨在为运维开发提供便捷的 Bot 权限检测、批量媒体分发上传和本地媒体解析能力。
+
+---
+
+## ⚙️ 快速开始
+
+### 1. 初始化项目与依赖
+```bash
+# 整理并同步依赖包
+go mod tidy
+```
+
+### 2. 编译并生成二进制文件
+```bash
+# 编译为本地二进制可执行文件 gotg
+go build -o gotg cmd/gotg/main.go
+```
+
+### 3. 配置运行环境
+项目支持使用本地 `.env` 文件进行配置，您可以复制并修改模板：
+```bash
+cp .env.example .env
+```
+在 `.env` 中填写您的常驻配置：
+```ini
+TOKEN=12345678:AAHdU-Z25K2D7YDMvS997v818wA8tQFg8G0
+CHAT_ID=@mychannel
+API_URL=http://[IP_ADDRESS]
+```
+
+---
+
+## 📋 命令行参数说明
+
+- **-t, --task** `<task_type>` (**必填**)
+  执行的任务类型。支持以下类型：
+  - `check_auth` : 校验 Bot Token 状态与频道管理员权限
+  - `up` : 批量分发上传媒体文件
+  - `check_media` : 纯本地媒体（视频/图像）编码及规格深度解析
+
+- **--token** `<tokens>` (**可选，可由 `.env` 提供**)
+  Telegram Bot Token。支持传入多个 Token，以英文逗号 `,` 分隔，工具会自动对多个 Bot 进行任务轮询分发。
+
+- **--chat_id** `<chat_id>` (**可选，可由 `.env` 提供**)
+  接收媒体消息的目标频道用户名 (带 `@`) 或数字 ID (如 `-100xxx`)。
+
+- **--api-url** `<url>` (**可选，可由 `.env` 提供**)
+  自定义 Telegram Bot API Server 的 URL 地址。若为空，则默认向官方 API 发送请求。
+
+- **-v, --version** (**可选**)
+  输出当前程序的软件版本号（当前版本：`v0.1.1`）。
+
+- **-h, --help** (**可选**)
+  打印帮助和使用说明。
+
+> [!NOTE]
+> **优先级规则**：如果同时提供了命令行 Flag 和 `.env` 配置，程序将**优先采用命令行 Flag 传递的参数**，仅在 Flag 未提供时才 fallback 去读取 `.env` 配置文件。
+
+---
+
+## 🚀 核心特性介绍
+
+### 1. 自定义 API 与 2GB 超大媒体上传
+*   **官方 API 模式**（未配置 `--api-url`）：受 Telegram 官方限制，单文件上传上限为 **50MB**。
+*   **自定义 API 模式**（配置了 `--api-url`，如使用自建本地 Bot API 服务）：上传限制放宽至最大 **2GB** (2000MB)。
+*   **本地智能拦截**：`gotg` 会在发送网络请求前先读取文件大小。一旦文件超过对应模式的上限（50MB 或 2GB），会自动拦截跳过并输出提示，避免因为网络传输过载或超时造成不必要的等待与流量消耗。
+
+### 2. Token 安全脱敏
+*   在执行任务（如 `check_auth` 或 `up`）输出 Bot 部署状态时，日志中打印的 Token 会被自动隐去核心密钥部分（如 `12345678:AAH***8G0`），从而在提供诊断所需辨识度的同时，杜绝录屏或日志截图中密钥泄露的安全风险。
+
+### 3. 多 Bot 任务轮询分发
+*   在 `--token` 参数中传入多个以逗号隔开的 Token 时，工具会轮询对每个 Bot 执行操作，提高上传分发效率并分散单一 API 限流风险。
+
+---
+
+## 💡 使用示例
+
+#### 示例 1：检测 Bot 是否有频道的管理员权限
+```bash
+./gotg -t check_auth
+```
+*(如果没有配置 `.env` 文件，则必须在命令行传参)*：
+```bash
+./gotg -t check_auth --token="123456:AAH..." --chat_id="@mychannel"
+```
+
+#### 示例 2：使用自定义 API 批量上传文件夹下的所有文件
+```bash
+./gotg -t up --api-url="http://[IP_ADDRESS]" /path/to/media/directory
+```
+
+#### 示例 3：纯本地深度解析视频或图片的编码与格式
+*(纯本地任务，无需网络及 Token)*：
+```bash
+./gotg -t check_media /path/to/video.mp4
+```
