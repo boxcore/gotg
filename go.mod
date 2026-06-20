@@ -1,4 +1,4 @@
-module gotg
+module github.com/boxcore/gotg
 
 go 1.25.7
 
