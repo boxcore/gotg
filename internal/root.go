@@ -11,16 +11,20 @@ import (
 )
 
 var (
-	task       string
-	tokenStr   string // 接收单个或多个逗号隔开 of Token
-	chatID     string
-	apiURL     string
-	groupSize  int
-	debugMode  string
-	sortType   string
-	cacheDir   string
-	cacheFresh bool
-	sleepTime  int
+	task        string
+	tokenStr    string // 接收单个或多个逗号隔开 of Token
+	chatID      string
+	apiURL      string
+	groupSize   int
+	debugMode   string
+	sortType    string
+	cacheDir    string
+	cacheFresh  bool
+	sleepTime   int
+	uploadTitle string
+	uploadTag   string
+	forceUp     bool
+	transcode   bool
 )
 
 // 💡 升级后的通用参数检查器：支持直接检查切片([]string)或普通字符串(string)
@@ -67,7 +71,7 @@ func parseTokens() []string {
 var RootCmd = &cobra.Command{
 	Use:     "gotg",
 	Short:   "gotg 是一个 Telegram Bot 运维及媒体辅助工具",
-	Version: "v0.1.1",
+	Version: "v0.1.2",
 	Run: func(cmd *cobra.Command, args []string) {
 		// 💡 如果命令行没有传递 Flag，则从环境变量中 Fallback
 		if tokenStr == "" {
@@ -149,7 +153,7 @@ var RootCmd = &cobra.Command{
 				}
 
 				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
-				if err := UploadDirectoryFiles(tgToken, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime); err != nil {
+				if err := UploadDirectoryFiles(tgToken, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
 					fmt.Printf("❌ 调试输出失败: %v\n", err)
 				}
 				return
@@ -174,7 +178,7 @@ var RootCmd = &cobra.Command{
 			fmt.Printf("📂 开始多 Bot 轮询/并发上传 (共 %d 个 Bot)...\n", len(activeTokens))
 			for i, t := range activeTokens {
 				fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
-				if err := UploadDirectoryFiles(t, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime); err != nil {
+				if err := UploadDirectoryFiles(t, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
 					fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
 				}
 			}
@@ -217,6 +221,10 @@ func init() {
 	RootCmd.Flags().StringVar(&cacheDir, "cache-dir", "~/.gotg/cache", "元数据与缩略图缓存目录")
 	RootCmd.Flags().BoolVar(&cacheFresh, "cache-fresh", false, "强制刷新缓存并重新生成缩略图")
 	RootCmd.Flags().IntVarP(&sleepTime, "sleep", "s", 30, "每组媒体上传完成后的休眠时间（秒）")
+	RootCmd.Flags().StringVar(&uploadTitle, "title", "", "媒体标题，若未指定默认采用文件名")
+	RootCmd.Flags().StringVar(&uploadTag, "tag", "", "媒体标题的尾部标签，例如 '#tag1 #tag2'")
+	RootCmd.Flags().BoolVar(&forceUp, "force-up", false, "强制重新上传已成功上传的文件")
+	RootCmd.Flags().BoolVar(&transcode, "transcode", false, "强制转码不合规的视频文件而不需要确认")
 
 	// 💡 加载本地 .env 配置文件
 	loadEnv()
