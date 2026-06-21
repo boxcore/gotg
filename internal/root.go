@@ -4,16 +4,23 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	task     string
-	tokenStr string // 接收单个或多个逗号隔开的 Token
-	chatID   string
-	apiURL   string
+	task       string
+	tokenStr   string // 接收单个或多个逗号隔开 of Token
+	chatID     string
+	apiURL     string
+	groupSize  int
+	debugMode  string
+	sortType   string
+	cacheDir   string
+	cacheFresh bool
+	sleepTime  int
 )
 
 // 💡 升级后的通用参数检查器：支持直接检查切片([]string)或普通字符串(string)
@@ -93,6 +100,61 @@ var RootCmd = &cobra.Command{
 			}
 
 		case "up":
+			// 校验 --sort
+			validSortTypes := map[string]bool{
+				"name_asc": true, "name_desc": true,
+				"size_asc": true, "size_desc": true,
+				"mod_asc": true, "mod_desc": true,
+				"created_asc": true, "created_desc": true,
+			}
+			if !validSortTypes[sortType] {
+				fmt.Println("❌ 错误: --sort 参数的值必须是以下之一: name_asc, name_desc, size_asc, size_desc, mod_asc, mod_desc, created_asc, created_desc")
+				os.Exit(1)
+			}
+
+			// 校验 --debug 参数，目前仅支持 list 和 curl
+			if debugMode != "" && debugMode != "list" && debugMode != "curl" {
+				fmt.Println("❌ 错误: --debug 参数仅支持 'list' 或 'curl' ！")
+				os.Exit(1)
+			}
+
+			if sleepTime < 0 {
+				fmt.Println("❌ 错误: -s/--sleep 休眠秒数不能小于 0！")
+				os.Exit(1)
+			}
+
+			expandedCacheDir := expandTilde(cacheDir)
+			if err := os.MkdirAll(expandedCacheDir, 0755); err != nil {
+				fmt.Printf("❌ 错误: 无法创建或访问缓存目录 '%s': %v\n", expandedCacheDir, err)
+				os.Exit(1)
+			}
+
+			if debugMode == "list" || debugMode == "curl" {
+				if len(args) < 1 {
+					fmt.Println("❌ 错误: 使用 -t=up 时，必须指定要上传的目录路径！")
+					os.Exit(1)
+				}
+				if groupSize <= 0 || groupSize > 10 {
+					fmt.Println("❌ 错误: -n/--group-size 参数指定的值必须在 1 到 10 之间！")
+					os.Exit(1)
+				}
+				
+				tgToken := "YOUR_BOT_TOKEN"
+				if len(activeTokens) > 0 {
+					tgToken = activeTokens[0]
+				}
+				tgChatID := "YOUR_CHAT_ID"
+				if chatID != "" {
+					tgChatID = chatID
+				}
+
+				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
+				if err := UploadDirectoryFiles(tgToken, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime); err != nil {
+					fmt.Printf("❌ 调试输出失败: %v\n", err)
+				}
+				return
+			}
+
 			// 💡 同样干净地复用万能校验器
 			ensureFlagsPresent("up", map[string]any{
 				"--chat_id": chatID,
@@ -104,10 +166,15 @@ var RootCmd = &cobra.Command{
 				os.Exit(1)
 			}
 
+			if groupSize <= 0 || groupSize > 10 {
+				fmt.Println("❌ 错误: -n/--group-size 参数指定的值必须在 1 到 10 之间！")
+				os.Exit(1)
+			}
+
 			fmt.Printf("📂 开始多 Bot 轮询/并发上传 (共 %d 个 Bot)...\n", len(activeTokens))
 			for i, t := range activeTokens {
 				fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
-				if err := UploadDirectoryFiles(t, chatID, args[0], apiURL); err != nil {
+				if err := UploadDirectoryFiles(t, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime); err != nil {
 					fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
 				}
 			}
@@ -144,6 +211,12 @@ func init() {
 	RootCmd.Flags().StringVar(&tokenStr, "token", "", "Telegram Bot Token，多个可用逗号隔开")
 	RootCmd.Flags().StringVar(&chatID, "chat_id", "", "目标频道的用户名(带@)或ID(如-100xxx)")
 	RootCmd.Flags().StringVar(&apiURL, "api-url", "", "自定义 Telegram Bot API Server URL (如 http://149.104.4.30:8081)")
+	RootCmd.Flags().IntVarP(&groupSize, "group-size", "n", 10, "指定上传的媒体组大小，默认是10，且不能超过10")
+	RootCmd.Flags().StringVar(&debugMode, "debug", "", "调试模式选项，如 'list' 用来测试打印文件上传顺序")
+	RootCmd.Flags().StringVar(&sortType, "sort", "name_asc", "待上传文件的排序规则 (name_asc, name_desc, size_asc, size_desc, mod_asc, mod_desc, created_asc, created_desc)")
+	RootCmd.Flags().StringVar(&cacheDir, "cache-dir", "~/.gotg/cache", "元数据与缩略图缓存目录")
+	RootCmd.Flags().BoolVar(&cacheFresh, "cache-fresh", false, "强制刷新缓存并重新生成缩略图")
+	RootCmd.Flags().IntVarP(&sleepTime, "sleep", "s", 30, "每组媒体上传完成后的休眠时间（秒）")
 
 	// 💡 加载本地 .env 配置文件
 	loadEnv()
@@ -177,6 +250,17 @@ func loadEnv() {
 			os.Setenv(key, val)
 		}
 	}
+}
+
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return path
+		}
+		return filepath.Join(home, path[1:])
+	}
+	return path
 }
 
 // 💡 辅助函数：对 Token 进行脱敏处理，保留 Bot ID 和密匙的前后几位，中间部分隐藏
