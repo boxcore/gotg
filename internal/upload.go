@@ -64,14 +64,13 @@ type uploadFile struct {
 	metadata    MediaMetadata
 }
 
-type DirectoryGroup struct {
-	RelativePath string
-	TitleBase    string
-	Files        []uploadFile
+type DirTask struct {
+	Path      string
+	TitleBase string
 }
 
-func scanAndCollectGroups(targetPath string, baseTitle string, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, sortType string) ([]DirectoryGroup, error) {
-	var groups []DirectoryGroup
+func scanAndCollectDirPaths(targetPath string, baseTitle string) ([]DirTask, error) {
+	var tasks []DirTask
 
 	var scan func(currentPath string, currentTitle string, level int) error
 	scan = func(currentPath string, currentTitle string, level int) error {
@@ -84,89 +83,45 @@ func scanAndCollectGroups(targetPath string, baseTitle string, cacheDir string, 
 			return err
 		}
 
-		var dirFiles []os.FileInfo
+		var hasFiles bool
 		var subDirs []os.DirEntry
 
 		for _, entry := range entries {
 			if entry.IsDir() {
-				subDirs = append(subDirs, entry)
+				if !strings.HasPrefix(entry.Name(), ".") {
+					subDirs = append(subDirs, entry)
+				}
 			} else {
-				info, err := entry.Info()
-				if err == nil {
-					dirFiles = append(dirFiles, info)
+				nameLower := strings.ToLower(entry.Name())
+				if !strings.HasPrefix(nameLower, ".") && (strings.HasSuffix(nameLower, ".png") ||
+					strings.HasSuffix(nameLower, ".jpg") ||
+					strings.HasSuffix(nameLower, ".jpeg") ||
+					strings.HasSuffix(nameLower, ".gif") ||
+					strings.HasSuffix(nameLower, ".webp") ||
+					strings.HasSuffix(nameLower, ".mp4") ||
+					strings.HasSuffix(nameLower, ".mov") ||
+					strings.HasSuffix(nameLower, ".avi") ||
+					strings.HasSuffix(nameLower, ".mpeg") ||
+					strings.HasSuffix(nameLower, ".mpg") ||
+					strings.HasSuffix(nameLower, ".flv") ||
+					strings.HasSuffix(nameLower, ".m4v") ||
+					strings.HasSuffix(nameLower, ".ts") ||
+					strings.HasSuffix(nameLower, ".mkv") ||
+					strings.HasSuffix(nameLower, ".wmv") ||
+					strings.HasSuffix(nameLower, ".rmvb") ||
+					strings.HasSuffix(nameLower, ".3gp")) {
+					hasFiles = true
 				}
 			}
 		}
 
-		// 处理当前目录的文件
-		if len(dirFiles) > 0 {
-			var files []uploadFile
-			for _, fileInfo := range dirFiles {
-				// 慢速扫描控制：每次扫描完一个文件休眠 100 毫秒，防止 WebDAV 密集 API 限制/风控
-				time.Sleep(100 * time.Millisecond)
-
-				filePath := filepath.Join(currentPath, fileInfo.Name())
-				meta, err := processMedia(filePath, fileInfo, cacheDir, cacheFresh, transcode, forceUp)
-				if err != nil {
-					fmt.Printf("⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", fileInfo.Name(), err)
-					continue
-				}
-
-				if meta.FileType == "other" {
-					fmt.Printf("ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", fileInfo.Name())
-					continue
-				}
-
-				if !forceUp && meta.UploadStatus == "success" {
-					fmt.Printf("ℹ️  文件已上传成功，自动跳过: %s\n", fileInfo.Name())
-					continue
-				}
-
-				files = append(files, uploadFile{
-					path:        meta.FilePath,
-					name:        fileInfo.Name(),
-					size:        meta.FileSize,
-					modTime:     meta.ModTime,
-					createdTime: meta.CreatedTime,
-					metadata:    meta,
-				})
-			}
-
-			if len(files) > 0 {
-				// 对当前目录的文件进行排序
-				sort.Slice(files, func(i, j int) bool {
-					f1, f2 := files[i], files[j]
-					switch sortType {
-					case "name_asc":
-						return naturalLess(f1.name, f2.name)
-					case "name_desc":
-						return naturalLess(f2.name, f1.name)
-					case "size_asc":
-						return f1.size < f2.size
-					case "size_desc":
-						return f1.size > f2.size
-					case "mod_asc":
-						return f1.modTime.Before(f2.modTime)
-					case "mod_desc":
-						return f1.modTime.After(f2.modTime)
-					case "created_asc":
-						return f1.createdTime.Before(f2.createdTime)
-					case "created_desc":
-						return f1.createdTime.After(f2.createdTime)
-					default:
-						return naturalLess(f1.name, f2.name)
-					}
-				})
-
-				groups = append(groups, DirectoryGroup{
-					RelativePath: currentPath,
-					TitleBase:    currentTitle,
-					Files:        files,
-				})
-			}
+		if hasFiles {
+			tasks = append(tasks, DirTask{
+				Path:      currentPath,
+				TitleBase: currentTitle,
+			})
 		}
 
-		// 递归处理子目录
 		for _, subDir := range subDirs {
 			subPath := filepath.Join(currentPath, subDir.Name())
 			subTitle := currentTitle + "/" + subDir.Name()
@@ -179,7 +134,84 @@ func scanAndCollectGroups(targetPath string, baseTitle string, cacheDir string, 
 	}
 
 	err := scan(targetPath, baseTitle, 1)
-	return groups, err
+	return tasks, err
+}
+
+func processSingleDir(dirPath string, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, sortType string) ([]uploadFile, error) {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []uploadFile
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// 慢速遍历控制：每次扫描完一个文件休眠 100 毫秒，防止 WebDAV 密集 API 限制/风控
+		time.Sleep(100 * time.Millisecond)
+
+		filePath := filepath.Join(dirPath, entry.Name())
+		meta, err := processMedia(filePath, info, cacheDir, cacheFresh, transcode, forceUp)
+		if err != nil {
+			fmt.Printf("⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", entry.Name(), err)
+			continue
+		}
+
+		if meta.FileType == "other" {
+			fmt.Printf("ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", entry.Name())
+			continue
+		}
+
+		if !forceUp && meta.UploadStatus == "success" {
+			fmt.Printf("ℹ️  文件已上传成功，自动跳过: %s\n", entry.Name())
+			continue
+		}
+
+		files = append(files, uploadFile{
+			path:        meta.FilePath,
+			name:        entry.Name(),
+			size:        meta.FileSize,
+			modTime:     meta.ModTime,
+			createdTime: meta.CreatedTime,
+			metadata:    meta,
+		})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		f1, f2 := files[i], files[j]
+		switch sortType {
+		case "name_asc":
+			return naturalLess(f1.name, f2.name)
+		case "name_desc":
+			return naturalLess(f2.name, f1.name)
+		case "size_asc":
+			return f1.size < f2.size
+		case "size_desc":
+			return f1.size > f2.size
+		case "mod_asc":
+			return f1.modTime.Before(f2.modTime)
+		case "mod_desc":
+			return f1.modTime.After(f2.modTime)
+		case "created_asc":
+			return f1.createdTime.Before(f2.createdTime)
+		case "created_desc":
+			return f1.createdTime.After(f2.createdTime)
+		default:
+			return naturalLess(f1.name, f2.name)
+		}
+	})
+
+	return files, nil
 }
 
 // UploadDirectoryFiles 读取 targetPath 下的多层文件并上传到指定频道
@@ -282,32 +314,42 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		}
 	}
 
-	// 3. 递归扫描 3 层子目录并收集各二级目录的任务组
-	var directoryGroups []DirectoryGroup
+	// 3. 极速探测各二级目录及子目录下的结构树，仅扫描路径不读取文件大属性
+	var allDirTasks []DirTask
 	for idx, d := range secondLevelDirs {
 		subDirPath := filepath.Join(cleanPath, d.Name())
 		baseTitleForThisDir := secondLevelBaseTitles[idx]
 
-		groupsForThisDir, err := scanAndCollectGroups(subDirPath, baseTitleForThisDir, cacheDir, cacheFresh, transcode, forceUp, sortType)
+		tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
 		if err != nil {
-			return fmt.Errorf("扫描二级子目录 '%s' 失败: %w", d.Name(), err)
+			return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
 		}
-		directoryGroups = append(directoryGroups, groupsForThisDir...)
+		allDirTasks = append(allDirTasks, tasksForThisDir...)
 	}
 
-	if len(directoryGroups) == 0 {
-		fmt.Println("没有符合上传条件的文件。")
+	if len(allDirTasks) == 0 {
+		fmt.Println("没有符合上传条件的目录或文件。")
 		return nil
 	}
 
-	// 3. 调试模式：list
+	// 4. 调试模式：list
 	if debugMode == "list" {
-		fmt.Printf("📂 [DEBUG 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录, 分组大小: %d)\n", cleanPath, len(directoryGroups), groupSize)
-		for _, dg := range directoryGroups {
-			filesToUpload := dg.Files
-			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
-			fmt.Printf("\n📂 目录任务: %s (对应标题前缀: %s, 媒体数: %d)\n", dg.RelativePath, dg.TitleBase, len(filesToUpload))
+		fmt.Printf("📂 [DEBUG 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录任务, 分组大小: %d)\n", cleanPath, len(allDirTasks), groupSize)
+		for idx, task := range allDirTasks {
+			fmt.Printf("\n🔍 正在读取并预处理第 %d/%d 个目录: %s (对应标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
 			
+			filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+			if err != nil {
+				fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+				continue
+			}
+
+			if len(filesToUpload) == 0 {
+				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
+				continue
+			}
+
+			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
 			for i := 0; i < len(filesToUpload); i += groupSize {
 				end := i + groupSize
 				if end > len(filesToUpload) {
@@ -317,7 +359,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				batchFiles := filesToUpload[i:end]
 				
 				// 拼装这组的标题
-				batchTitle := dg.TitleBase
+				batchTitle := task.TitleBase
 				if totalBatches > 1 {
 					batchTitle += fmt.Sprintf("（%d）", batchNum)
 				}
@@ -326,7 +368,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				}
 
 				fmt.Printf("  📦 [组 %d/%d] 发送标题为:\n\"\"\"\n%s\n\"\"\"\n", batchNum, totalBatches, batchTitle)
-				for idx, f := range batchFiles {
+				for fileIdx, f := range batchFiles {
 					details := ""
 					if f.metadata.FileType == "video" {
 						details = fmt.Sprintf("时长: %.1fs, 比例: %s", f.metadata.Duration, f.metadata.AspectRatio)
@@ -342,16 +384,16 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					if details != "" {
 						details = " (" + details + ")"
 					}
-					fmt.Printf("    ├─ %d. %s (%s)%s\n", idx+1, f.name, formatSize(f.size), details)
+					fmt.Printf("    ├─ %d. %s (%s)%s\n", fileIdx+1, f.name, formatSize(f.size), details)
 				}
 			}
 		}
 		return nil
 	}
 
-	// 4. 调试模式：curl
+	// 5. 调试模式：curl
 	if debugMode == "curl" {
-		fmt.Printf("📂 [DEBUG CURL 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录)\n", cleanPath, len(directoryGroups))
+		fmt.Printf("📂 [DEBUG CURL 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录任务)\n", cleanPath, len(allDirTasks))
 		
 		baseAPI := "https://api.telegram.org"
 		if apiURL != "" {
@@ -359,11 +401,21 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		}
 
 		tokenIdx := 0
-		for _, dg := range directoryGroups {
-			filesToUpload := dg.Files
-			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
-			fmt.Printf("\n📂 目录任务: %s (标题前缀: %s)\n", dg.RelativePath, dg.TitleBase)
+		for idx, task := range allDirTasks {
+			fmt.Printf("\n🔍 正在读取并预处理第 %d/%d 个目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+			
+			filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+			if err != nil {
+				fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+				continue
+			}
 
+			if len(filesToUpload) == 0 {
+				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
+				continue
+			}
+
+			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
 			for i := 0; i < len(filesToUpload); i += groupSize {
 				end := i + groupSize
 				if end > len(filesToUpload) {
@@ -377,7 +429,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				apiEndpoint := fmt.Sprintf("%s/bot%s/sendMediaGroup", baseAPI, currToken)
 
 				// 拼装标题
-				batchTitle := dg.TitleBase
+				batchTitle := task.TitleBase
 				if totalBatches > 1 {
 					batchTitle += fmt.Sprintf("（%d）", batchNum)
 				}
@@ -389,8 +441,8 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 				var mediaItems []string
 				var filesFields []string
-				for idx, f := range batchFiles {
-					attachName := fmt.Sprintf("file%d", idx)
+				for mediaIdx, f := range batchFiles {
+					attachName := fmt.Sprintf("file%d", mediaIdx)
 					uploadPath := f.path
 					if f.metadata.TranPath != "" {
 						uploadPath = f.metadata.TranPath
@@ -398,7 +450,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 					// 仅给媒体组的第一个文件设置 caption
 					escapedCaption := ""
-					if idx == 0 {
+					if mediaIdx == 0 {
 						escapedCaption = strings.ReplaceAll(batchTitle, "\n", "\\n")
 						escapedCaption = strings.ReplaceAll(escapedCaption, `"`, `\"`)
 					}
@@ -410,7 +462,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					}
 
 					if f.metadata.FileType == "video" {
-						thumbAttachName := fmt.Sprintf("thumb_video%d", idx)
+						thumbAttachName := fmt.Sprintf("thumb_video%d", mediaIdx)
 						mediaItems = append(mediaItems, fmt.Sprintf(`       {
          \"type\": \"video\",
          \"media\": \"attach://%s\",
@@ -433,7 +485,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					} else {
 						// 其他文件降级使用 document 类型
 						if f.metadata.ThumbPath != "" {
-							thumbAttachName := fmt.Sprintf("thumb_doc%d", idx)
+							thumbAttachName := fmt.Sprintf("thumb_doc%d", mediaIdx)
 							mediaItems = append(mediaItems, fmt.Sprintf(`       {
          \"type\": \"document\",
          \"media\": \"attach://%s\",
@@ -472,7 +524,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		return nil
 	}
 
-	// 5. 实际上传模式
+	// 6. 实际上传模式
 	var bots []*telego.Bot
 	for _, t := range tokens {
 		var opts []telego.BotOption
@@ -491,12 +543,23 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	tokenIdx := 0
 	count := 0
 
-	for _, dg := range directoryGroups {
-		filesToUpload := dg.Files
-		totalFiles := len(filesToUpload)
-		totalBatches := (totalFiles + groupSize - 1) / groupSize
+	for idx, task := range allDirTasks {
+		fmt.Printf("\n🔍 [%d/%d] 正在读取并预处理目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+		
+		filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+		if err != nil {
+			fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+			continue
+		}
 
-		fmt.Printf("\n📂 开始上传目录: %s (对应标题前缀: %s, 共 %d 个待上传文件)\n", dg.RelativePath, dg.TitleBase, totalFiles)
+		totalFiles := len(filesToUpload)
+		if totalFiles == 0 {
+			fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
+			continue
+		}
+
+		totalBatches := (totalFiles + groupSize - 1) / groupSize
+		fmt.Printf("📂 开始上传该目录，共 %d 个待上传文件\n", totalFiles)
 
 		for i := 0; i < totalFiles; i += groupSize {
 			end := i + groupSize
@@ -543,7 +606,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			}
 
 			// 拼装这组的标题
-			batchTitle := dg.TitleBase
+			batchTitle := task.TitleBase
 			if totalBatches > 1 {
 				batchTitle += fmt.Sprintf("（%d）", batchNum)
 			}
@@ -561,7 +624,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			var mediaList []telego.InputMedia
 			var openErr error
 
-			for idx, f := range validatedBatch {
+			for mediaIdx, f := range validatedBatch {
 				uploadPath := f.path
 				if f.metadata.TranPath != "" {
 					uploadPath = f.metadata.TranPath
@@ -570,7 +633,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 				// 仅给媒体组的第一个文件设置 Caption
 				caption := ""
-				if idx == 0 {
+				if mediaIdx == 0 {
 					caption = batchTitle
 				}
 
