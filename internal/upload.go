@@ -975,7 +975,18 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 				fmt.Printf("ℹ️  运行转码命令: ffmpeg %s\n", strings.Join(args, " "))
 
 				cmdTrans := exec.Command("ffmpeg", args...)
-				if err := cmdTrans.Run(); err == nil {
+				errTrans := cmdTrans.Run()
+				if errTrans != nil && encoder != "libx264" {
+					fmt.Printf("⚠️  硬件加速编码器 '%s' 转码失败（可能由于缺乏硬件或驱动支持）: %v\n", encoder, errTrans)
+					fmt.Println("🔄 正在尝试自动降级到 CPU 软件编码器 (libx264) 重新转码...")
+					encoder = "libx264"
+					args = []string{"-y", "-i", orgPath, "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", transcodingPath}
+					fmt.Printf("ℹ️  运行转码命令: ffmpeg %s\n", strings.Join(args, " "))
+					cmdTrans = exec.Command("ffmpeg", args...)
+					errTrans = cmdTrans.Run()
+				}
+
+				if errTrans == nil {
 					_ = os.Rename(transcodingPath, h264Path)
 					_ = os.Remove(orgPath)
 
