@@ -6,24 +6,50 @@
 
 ## ⚙️ 快速开始
 
-### 1. 初始化项目与依赖
+### 📥 自动下载安装最新发布版 (推荐)
+
+直接在终端运行以下一键命令，程序将自动识别您的操作系统 (Linux/macOS) 及架构，下载最新的 `gotg` 发布包并安装至系统的 `/usr/local/bin` 目录：
+
+```bash
+curl -s https://api.github.com/repos/boxcore/gotg/releases/latest \
+| grep "browser_download_url.*$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')" \
+| cut -d : -f 2,3 | tr -d \" | xargs curl -L -o gotg.tar.gz \
+&& tar -xzf gotg.tar.gz \
+&& sudo mv gotg /usr/local/bin/ \
+&& rm gotg.tar.gz README.md
+```
+
+*提示: 在执行上面命令时，若提示 `/usr/local/bin` 权限不足，会自动调用 `sudo` 提权。*
+
+---
+
+### 🛠️ 从源码编译安装 (可选)
+
+若需要从源码手动编译：
+
+#### 1. 初始化项目与依赖
 ```bash
 # 整理并同步依赖包
 go mod tidy
 ```
 
-### 2. 编译并生成二进制文件
+#### 2. 编译并生成二进制文件
 ```bash
 # 编译为本地二进制可执行文件 gotg
 go build -o gotg cmd/gotg/main.go
+# 移动到全局 bin 目录下
+sudo mv gotg /usr/local/bin/
 ```
 
-### 3. 配置运行环境
+---
+
+### ⚙️ 配置运行环境
+
 项目支持使用本地 `.env` 文件进行配置，您可以复制并修改模板：
 ```bash
 cp .env.example .env
 ```
-在 `.env` 中填写您的常驻配置：
+在运行目录下的 `.env` 中填写您的常驻配置：
 ```ini
 TOKEN=12345678:AAHdU-Z25K2D7YDMvS997v818wA8tQFg8G0
 CHAT_ID=@mychannel
