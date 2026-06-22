@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -23,8 +24,9 @@ var (
 	sleepTime   int
 	uploadTitle string
 	uploadTag   string
-	forceUp     bool
-	transcode   bool
+	forceUp      bool
+	transcode    bool
+	useRRotation bool
 )
 
 // 💡 升级后的通用参数检查器：支持直接检查切片([]string)或普通字符串(string)
@@ -143,9 +145,9 @@ var RootCmd = &cobra.Command{
 					os.Exit(1)
 				}
 				
-				tgToken := "YOUR_BOT_TOKEN"
+				tgTokens := []string{"YOUR_BOT_TOKEN"}
 				if len(activeTokens) > 0 {
-					tgToken = activeTokens[0]
+					tgTokens = activeTokens
 				}
 				tgChatID := "YOUR_CHAT_ID"
 				if chatID != "" {
@@ -153,7 +155,7 @@ var RootCmd = &cobra.Command{
 				}
 
 				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
-				if err := UploadDirectoryFiles(tgToken, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
 					fmt.Printf("❌ 调试输出失败: %v\n", err)
 				}
 				return
@@ -175,11 +177,38 @@ var RootCmd = &cobra.Command{
 				os.Exit(1)
 			}
 
-			fmt.Printf("📂 开始多 Bot 轮询/并发上传 (共 %d 个 Bot)...\n", len(activeTokens))
-			for i, t := range activeTokens {
-				fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
-				if err := UploadDirectoryFiles(t, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
-					fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
+			if useRRotation {
+				if len(activeTokens) == 1 {
+					fmt.Println("⚠️  警告: 使用 -r 参数建议部署多个 token。您目前只配置了一个 token，建议至少设置 3 个以跳过 Telegram 频控/风控！")
+					fmt.Println("⏳ 请在 5 秒内按回车 [Enter] 确认继续执行，未确认将自动退出...")
+
+					confirmChan := make(chan struct{}, 1)
+					go func() {
+						var input string
+						_, _ = fmt.Scanln(&input)
+						confirmChan <- struct{}{}
+					}()
+
+					select {
+					case <-confirmChan:
+						// 用户确认，继续执行
+					case <-time.After(5 * time.Second):
+						fmt.Println("\n⏰ 5秒超时未确认，程序已自动退出。")
+						os.Exit(0)
+					}
+				}
+
+				fmt.Printf("📂 开始多 Bot 轮询上传 (共 %d 个 Bot)...\n", len(activeTokens))
+				if err := UploadDirectoryFiles(activeTokens, true, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+					fmt.Printf("❌ 轮询上传中断: %v\n", err)
+				}
+			} else {
+				fmt.Printf("📂 开始多 Bot 独立完全上传 (共 %d 个 Bot)...\n", len(activeTokens))
+				for i, t := range activeTokens {
+					fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
+					if err := UploadDirectoryFiles([]string{t}, false, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+						fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
+					}
 				}
 			}
 
@@ -225,6 +254,7 @@ func init() {
 	RootCmd.Flags().StringVar(&uploadTag, "tag", "", "媒体标题的尾部标签，例如 '#tag1 #tag2'")
 	RootCmd.Flags().BoolVar(&forceUp, "force-up", false, "强制重新上传已成功上传的文件")
 	RootCmd.Flags().BoolVar(&transcode, "transcode", false, "强制转码不合规的视频文件而不需要确认")
+	RootCmd.Flags().BoolVarP(&useRRotation, "r-rotation", "r", false, "轮询使用多个 Token 上传各个媒体组")
 
 	// 💡 加载本地 .env 配置文件
 	loadEnv()
