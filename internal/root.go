@@ -5,11 +5,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+)
+
+var (
+	Version   = "v0.1.6"
+	BuildTime = "2026-06-23 00:55:00"
+	Author    = "boxcore"
 )
 
 var (
@@ -76,7 +83,7 @@ func parseTokens() []string {
 var RootCmd = &cobra.Command{
 	Use:     "gotg",
 	Short:   "gotg 是一个 Telegram Bot 运维及媒体辅助工具",
-	Version: "v0.1.6",
+	Version: Version,
 	Run: func(cmd *cobra.Command, args []string) {
 		// 💡 如果命令行没有传递 Flag，则从环境变量中 Fallback
 		if tokenStr == "" {
@@ -254,6 +261,9 @@ func Execute() {
 }
 
 func init() {
+	RootCmd.SetVersionTemplate(fmt.Sprintf("gotg version %s (built at %s, %s/%s, %s, author: %s)\n",
+		Version, BuildTime, runtime.GOOS, runtime.GOARCH, runtime.Version(), Author))
+
 	RootCmd.Flags().StringVarP(&task, "task", "t", "", "执行的任务类型 (check_auth, up, check_media)")
 	RootCmd.Flags().StringVar(&tokenStr, "token", "", "Telegram Bot Token，多个可用逗号隔开")
 	RootCmd.Flags().StringVar(&chatID, "chat_id", "", "目标频道的用户名(带@)或ID(如-100xxx)")
