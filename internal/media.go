@@ -18,12 +18,19 @@ import (
 // FFProbeResult 用于接收 ffprobe 的 JSON 输出
 type FFProbeResult struct {
 	Streams []struct {
-		CodecType string `json:"codec_type"`
-		CodecName string `json:"codec_name"`
-		Width     int    `json:"width"`
-		Height    int    `json:"height"`
-		BitRate   string `json:"bit_rate"`
-		Duration  string `json:"duration"`
+		CodecType    string `json:"codec_type"`
+		CodecName    string `json:"codec_name"`
+		Width        int    `json:"width"`
+		Height       int    `json:"height"`
+		BitRate      string `json:"bit_rate"`
+		Duration     string `json:"duration"`
+		SideDataList []struct {
+			SideDataType string `json:"side_data_type"`
+			Rotation     int    `json:"rotation"`
+		} `json:"side_data_list"`
+		Tags struct {
+			Rotate string `json:"rotate"`
+		} `json:"tags"`
 	} `json:"streams"`
 	Format struct {
 		BitRate  string `json:"bit_rate"`
@@ -114,7 +121,7 @@ func analyzeImage(path string) {
 // 2. 视频深度解析 (通过 os/exec 调用系统的 ffprobe)
 func analyzeVideo(path string) {
 	// 组装 ffprobe 命令，让其返回标准的 JSON 字符串
-	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,bit_rate,duration:format=duration,bit_rate", "-of", "json", path)
+	cmd := exec.Command("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path)
 	output, err := cmd.Output()
 	if err != nil {
 		fmt.Println("   └─ ❌ 视频解析失败: 请检查系统是否安装了 ffmpeg/ffprobe")
@@ -127,7 +134,7 @@ func analyzeVideo(path string) {
 		return
 	}
 
-	// 解析格式层面的总时长和总码率
+	// 解析格式层面的总时长 and 总码率
 	var totalDuration, totalBitrate string
 	if data.Format.Duration != "" {
 		d, _ := time.ParseDuration(data.Format.Duration + "s")
@@ -153,6 +160,31 @@ func analyzeVideo(path string) {
 			}
 			fmt.Printf("   ├─ [视频流] 编码格式: %s\n", stream.CodecName)
 			fmt.Printf("   ├─ [视频流] 分辨率(宽高): %d x %d\n", stream.Width, stream.Height)
+
+			// 检查视频流的旋转角度
+			rotation := 0
+			for _, sd := range stream.SideDataList {
+				if strings.EqualFold(sd.SideDataType, "Display Matrix") {
+					rotation = sd.Rotation
+				}
+			}
+			if rotation == 0 && stream.Tags.Rotate != "" {
+				var rot int
+				if _, err := fmt.Sscanf(stream.Tags.Rotate, "%d", &rot); err == nil {
+					rotation = rot
+				}
+			}
+			if rotation != 0 {
+				fmt.Printf("   ├─ [视频流] 旋转角度: %d 度\n", rotation)
+				absRot := rotation
+				if absRot < 0 {
+					absRot = -absRot
+				}
+				if absRot == 90 || absRot == 270 {
+					fmt.Printf("   ├─ [视频流] 实际播放分辨率: %d x %d\n", stream.Height, stream.Width)
+				}
+			}
+
 			fmt.Printf("   ├─ [视频流] 视频码率: %s\n", vBitrate)
 		} else if stream.CodecType == "audio" {
 			var aBitrate = "未知"

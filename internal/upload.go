@@ -1066,15 +1066,40 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 		}
 
 		// A. ffprobe 解析视频元数据
-		cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,bit_rate,duration:format=duration,bit_rate", "-of", "json", meta.FilePath)
+		cmd := exec.Command("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", meta.FilePath)
 		output, err := cmd.Output()
 		if err == nil {
 			var data FFProbeResult
 			if err := json.Unmarshal(output, &data); err == nil {
 				for _, stream := range data.Streams {
 					if stream.CodecType == "video" {
-						meta.Width = stream.Width
-						meta.Height = stream.Height
+						// 检查视频流的旋转角度
+						rotation := 0
+						for _, sd := range stream.SideDataList {
+							if strings.EqualFold(sd.SideDataType, "Display Matrix") {
+								rotation = sd.Rotation
+							}
+						}
+						if rotation == 0 && stream.Tags.Rotate != "" {
+							var rot int
+							if _, err := fmt.Sscanf(stream.Tags.Rotate, "%d", &rot); err == nil {
+								rotation = rot
+							}
+						}
+
+						absRot := rotation
+						if absRot < 0 {
+							absRot = -absRot
+						}
+						// 如果旋转了 90 或 270 度，则物理展示的宽高在提交给 TG 时需要翻转
+						if absRot == 90 || absRot == 270 {
+							meta.Width = stream.Height
+							meta.Height = stream.Width
+						} else {
+							meta.Width = stream.Width
+							meta.Height = stream.Height
+						}
+
 						meta.VideoCodec = stream.CodecName
 						if stream.BitRate != "" {
 							var br int64
