@@ -344,19 +344,15 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				continue
 			}
 
-			if len(filesToUpload) == 0 {
+			batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
+			if len(batches) == 0 {
 				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 				continue
 			}
 
-			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
-			for i := 0; i < len(filesToUpload); i += groupSize {
-				end := i + groupSize
-				if end > len(filesToUpload) {
-					end = len(filesToUpload)
-				}
-				batchNum := i/groupSize + 1
-				batchFiles := filesToUpload[i:end]
+			totalBatches := len(batches)
+			for batchIdx, batchFiles := range batches {
+				batchNum := batchIdx + 1
 				
 				// 拼装这组的标题
 				batchTitle := task.TitleBase
@@ -410,19 +406,15 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				continue
 			}
 
-			if len(filesToUpload) == 0 {
+			batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
+			if len(batches) == 0 {
 				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 				continue
 			}
 
-			totalBatches := (len(filesToUpload) + groupSize - 1) / groupSize
-			for i := 0; i < len(filesToUpload); i += groupSize {
-				end := i + groupSize
-				if end > len(filesToUpload) {
-					end = len(filesToUpload)
-				}
-				batchNum := i/groupSize + 1
-				batchFiles := filesToUpload[i:end]
+			totalBatches := len(batches)
+			for batchIdx, batchFiles := range batches {
+				batchNum := batchIdx + 1
 
 				// 计算 Token
 				currToken := tokens[tokenIdx]
@@ -516,7 +508,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					tokenIdx = (tokenIdx + 1) % len(tokens)
 				}
 
-				if i+groupSize < len(filesToUpload) {
+				if batchIdx < totalBatches - 1 {
 					fmt.Printf("💤 [CURL 模式] 每组输出后模拟休眠 %d 秒...\n", sleepTime)
 				}
 			}
@@ -552,57 +544,25 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			continue
 		}
 
-		totalFiles := len(filesToUpload)
-		if totalFiles == 0 {
+		batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
+		totalBatches := len(batches)
+		if totalBatches == 0 {
 			fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 			continue
 		}
 
-		totalBatches := (totalFiles + groupSize - 1) / groupSize
-		fmt.Printf("📂 开始上传该目录，共 %d 个待上传文件\n", totalFiles)
+		fmt.Printf("📂 开始上传该目录，共 %d 个待上传文件 (已智能拆分为 %d 个媒体组)\n", countFiles(batches), totalBatches)
 
-		for i := 0; i < totalFiles; i += groupSize {
-			end := i + groupSize
-			if end > totalFiles {
-				end = totalFiles
-			}
-			batch := filesToUpload[i:end]
-			batchNum := i/groupSize + 1
+		for batchIdx, batch := range batches {
+			batchNum := batchIdx + 1
 
 			// 切换 Bot
 			bot := bots[tokenIdx]
 			token := tokens[tokenIdx]
 
-			// 验证上传限制
-			var validatedBatch []uploadFile
 			var totalBytes int64
 			for _, f := range batch {
-				realUploadSize := f.size
-				if f.metadata.TranPath != "" {
-					if tranInfo, err := os.Stat(f.metadata.TranPath); err == nil {
-						realUploadSize = tranInfo.Size()
-					}
-				}
-
-				limit := int64(50 * 1024 * 1024)
-				limitStr := "50MB"
-				if apiURL != "" {
-					limit = 2000 * 1024 * 1024
-					limitStr = "2GB"
-				}
-
-				if realUploadSize > limit {
-					fmt.Printf("❌ 跳过 %s (上传体积 %s 超过 %s 限制)\n", f.name, formatSize(realUploadSize), limitStr)
-					continue
-				}
-				
-				f.size = realUploadSize // 校正为实际上传大小
-				totalBytes += realUploadSize
-				validatedBatch = append(validatedBatch, f)
-			}
-
-			if len(validatedBatch) == 0 {
-				continue
+				totalBytes += f.size
 			}
 
 			// 拼装这组的标题
@@ -614,7 +574,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				batchTitle += "\n" + uploadTag
 			}
 
-			fmt.Printf("🚀 正在以媒体组上传 %d 个文件 (使用 Bot Token: %s)...\n", len(validatedBatch), maskToken(token))
+			fmt.Printf("🚀 正在以媒体组上传 %d 个文件 (使用 Bot Token: %s)...\n", len(batch), maskToken(token))
 
 			var uploadedBytes int64
 			var currentFile string
@@ -624,7 +584,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			var mediaList []telego.InputMedia
 			var openErr error
 
-			for mediaIdx, f := range validatedBatch {
+			for mediaIdx, f := range batch {
 				uploadPath := f.path
 				if f.metadata.TranPath != "" {
 					uploadPath = f.metadata.TranPath
@@ -733,13 +693,13 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 			if err != nil {
 				fmt.Printf("❌ 媒体组上传失败: %v\n", err)
-				for _, f := range validatedBatch {
+				for _, f := range batch {
 					updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
 				}
 			} else {
-				fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(validatedBatch))
-				count += len(validatedBatch)
-				for _, f := range validatedBatch {
+				fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
+				count += len(batch)
+				for _, f := range batch {
 					updateCacheStatus(cacheDir, f.metadata.SHA1, "success")
 					cleanTranscodeFiles(cacheDir, f.metadata)
 				}
@@ -752,7 +712,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			}
 
 			// 休眠
-			if i+groupSize < totalFiles || tokenIdx > 0 {
+			if batchIdx < totalBatches - 1 || (useRRotation && len(bots) > 1) {
 				fmt.Printf("💤 已完成该媒体组处理，根据设置休眠 %d 秒以防止 API 频控/风控...\n", sleepTime)
 				time.Sleep(time.Duration(sleepTime) * time.Second)
 			}
@@ -1343,4 +1303,62 @@ func drawProgressBar(uploaded, total int64, fileName string) {
 		formatSize(total),
 		shrunkName,
 	)
+}
+
+// splitIntoBatches 根据文件大小上限 (1.9GB) 和最大数量限制，智能地对文件列表进行多组切分
+func splitIntoBatches(files []uploadFile, groupSize int, apiURL string) [][]uploadFile {
+	var eligibleFiles []uploadFile
+	limit := int64(50 * 1024 * 1024)
+	limitStr := "50MB"
+	if apiURL != "" {
+		limit = 2000 * 1024 * 1024
+		limitStr = "2GB"
+	}
+
+	for _, f := range files {
+		realUploadSize := f.size
+		if f.metadata.TranPath != "" {
+			if tranInfo, err := os.Stat(f.metadata.TranPath); err == nil {
+				realUploadSize = tranInfo.Size()
+			}
+		}
+
+		if realUploadSize > limit {
+			fmt.Printf("❌ 跳过 %s (上传体积 %s 超过 %s 限制)\n", f.name, formatSize(realUploadSize), limitStr)
+			continue
+		}
+
+		f.size = realUploadSize
+		eligibleFiles = append(eligibleFiles, f)
+	}
+
+	var batches [][]uploadFile
+	maxGroupBytes := int64(1900 * 1024 * 1024) // 1.9GB，安全阀值，预留富余应对 HTTP 协议头
+
+	var currentBatch []uploadFile
+	var currentBatchBytes int64
+
+	for _, f := range eligibleFiles {
+		// 若当前组大小已满，或者加入该文件会使这组总体积超过 1.9GB，则存入当前组并开启新组
+		if len(currentBatch) >= groupSize || (len(currentBatch) > 0 && currentBatchBytes+f.size > maxGroupBytes) {
+			batches = append(batches, currentBatch)
+			currentBatch = []uploadFile{f}
+			currentBatchBytes = f.size
+		} else {
+			currentBatch = append(currentBatch, f)
+			currentBatchBytes += f.size
+		}
+	}
+	if len(currentBatch) > 0 {
+		batches = append(batches, currentBatch)
+	}
+	return batches
+}
+
+func countFiles(batches [][]uploadFile) int {
+	total := 0
+	for _, b := range batches {
+		total += len(b)
+	}
+	return total
 }
