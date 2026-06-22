@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -380,12 +381,28 @@ func getDisplayTitleBase(titleBase string) string {
 }
 
 // UploadDirectoryFiles 读取 targetPath 下的多层文件并上传到指定频道
-func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, isTitleSpecified bool, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
+func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, notifyID string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, isTitleSpecified bool, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
 		return fmt.Errorf("路径不存在或无法访问: %w", err)
 	}
+
+	startTime := time.Now()
+
+	// 统计变量定义
+	totalSuccessCount := 0
+	totalFailedCount := 0
+	totalGroupsCount := 0
+	successGroupsCount := 0
+	failedGroupsCount := 0
+
+	type failedGroupInfo struct {
+		Title string
+		Files []string
+		Err   string
+	}
+	var failedGroups []failedGroupInfo
 
 	// 确定标题规则
 	titleRule := 0 // 默认不设置标题
@@ -824,7 +841,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		bots = append(bots, bot)
 	}
 
-	chatID := telego.ChatID{Username: chatIDStr}
+	chatID := parseChatID(chatIDStr)
 	tokenIdx := 0
 	count := 0
 
@@ -1010,9 +1027,22 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 						_ = fh.Close()
 					}
 					fmt.Println("❌ 上传组失败: 无法打开部分文件")
+					totalGroupsCount++
+					failedGroupsCount++
+					var fileNames []string
+					for _, f := range batch {
+						fileNames = append(fileNames, f.name)
+						totalFailedCount++
+					}
+					failedGroups = append(failedGroups, failedGroupInfo{
+						Title: batchTitle,
+						Files: fileNames,
+						Err:   "打开文件失败: " + openErr.Error(),
+					})
 					continue
 				}
 
+				totalGroupsCount++
 				_, err = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
 					ChatID: chatID,
 					Media:  mediaList,
@@ -1031,6 +1061,17 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					for _, f := range batch {
 						updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
 					}
+					failedGroupsCount++
+					var fileNames []string
+					for _, f := range batch {
+						fileNames = append(fileNames, f.name)
+						totalFailedCount++
+					}
+					failedGroups = append(failedGroups, failedGroupInfo{
+						Title: batchTitle,
+						Files: fileNames,
+						Err:   err.Error(),
+					})
 				} else {
 					fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
 					count += len(batch)
@@ -1038,6 +1079,8 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 						updateCacheStatus(cacheDir, f.metadata.SHA1, "success")
 						cleanTranscodeFiles(cacheDir, f.metadata)
 					}
+					successGroupsCount++
+					totalSuccessCount += len(batch)
 				}
 
 				if useRRotation && len(bots) > 1 {
@@ -1055,6 +1098,62 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	}
 
 	fmt.Printf("\n🎉 所有目录的上传任务结束，成功上传了 %d 个文件。\n", count)
+
+	// 发送任务完成报告
+	if notifyID != "" && debugMode == "" && len(bots) > 0 {
+		duration := time.Since(startTime)
+		durStr := formatDuration(duration)
+
+		hostname, hostnameErr := os.Hostname()
+		if hostnameErr != nil {
+			hostname = "unknown-host"
+		}
+
+		loc := time.FixedZone("CST", 8*3600) // 东八区
+		endTimeStr := time.Now().In(loc).Format("2006-01-02 15:04:05")
+
+		var sb strings.Builder
+		sb.WriteString("🔔 <b>gotg 媒体上传任务已完成</b>\n\n")
+		sb.WriteString(fmt.Sprintf("💻 <b>执行服务器</b>：<code>%s</code>\n", escapeHTML(hostname)))
+		sb.WriteString(fmt.Sprintf("📂 <b>目标路径</b>：<code>%s</code>\n", escapeHTML(targetPath)))
+		sb.WriteString(fmt.Sprintf("📅 <b>完成时间</b>：<code>%s (UTC+8)</code>\n", endTimeStr))
+		sb.WriteString(fmt.Sprintf("⏱ <b>任务耗时</b>：<code>%s</code>\n", durStr))
+		sb.WriteString(fmt.Sprintf("📊 <b>成功上传</b>：<code>%d</code> 个文件\n", totalSuccessCount))
+		if totalFailedCount > 0 {
+			sb.WriteString(fmt.Sprintf("❌ <b>失败文件</b>：<code>%d</code> 个\n", totalFailedCount))
+		}
+		sb.WriteString(fmt.Sprintf("📦 <b>媒体组统计</b>：成功 <code>%d</code> 组 / 失败 <code>%d</code> 组 / 总共 <code>%d</code> 组\n", successGroupsCount, failedGroupsCount, totalGroupsCount))
+
+		if len(failedGroups) > 0 {
+			sb.WriteString("\n⚠️ <b>失败资源明细</b>：\n")
+			for i, fg := range failedGroups {
+				titleText := fg.Title
+				if titleText == "" {
+					titleText = "(无标题)"
+				}
+				sb.WriteString(fmt.Sprintf("\n<b>%d. 组标题：%s</b>\n", i+1, escapeHTML(titleText)))
+				sb.WriteString(fmt.Sprintf("   原因：<code>%s</code>\n", escapeHTML(fg.Err)))
+				sb.WriteString("   文件列表：\n")
+				for _, f := range fg.Files {
+					sb.WriteString(fmt.Sprintf("   ├─ <code>%s</code>\n", escapeHTML(f)))
+				}
+			}
+		}
+
+		targetChatID := parseChatID(notifyID)
+		fmt.Printf("\n🔄 正在向通知接收人 (%s) 发送任务完成报告...\n", notifyID)
+		_, sendErr := bots[0].SendMessage(context.Background(), &telego.SendMessageParams{
+			ChatID:    targetChatID,
+			Text:      sb.String(),
+			ParseMode: telego.ModeHTML,
+		})
+		if sendErr != nil {
+			fmt.Printf("⚠️ 报告发送失败: %v\n", sendErr)
+		} else {
+			fmt.Println("✅ 完成报告已成功发送至您的 Telegram！")
+		}
+	}
+
 	return nil
 }
 
@@ -1796,4 +1895,35 @@ func isMediaFile(name string) bool {
 	isPotentialVideoFile := (ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".mpeg" || ext == ".mpg" || ext == ".flv" || ext == ".m4v" || ext == ".ts" || ext == ".mkv" || ext == ".wmv" || ext == ".rmvb" || ext == ".3gp")
 	isImageFile := (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp")
 	return isPotentialVideoFile || isImageFile
+}
+
+func parseChatID(str string) telego.ChatID {
+	if id, err := strconv.ParseInt(str, 10, 64); err == nil {
+		return telego.ChatID{ID: id}
+	}
+	return telego.ChatID{Username: str}
+}
+
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+
+	if h > 0 {
+		return fmt.Sprintf("%dh %dm %ds", h, m, s)
+	}
+	if m > 0 {
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	return fmt.Sprintf("%ds", s)
 }
