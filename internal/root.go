@@ -165,7 +165,7 @@ var RootCmd = &cobra.Command{
 				}
 
 				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
-				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
+				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 调试输出失败: %v\n", err)
 				}
 				return
@@ -209,14 +209,14 @@ var RootCmd = &cobra.Command{
 				}
 
 				fmt.Printf("📂 开始多 Bot 轮询上传 (共 %d 个 Bot)...\n", len(activeTokens))
-				if err := UploadDirectoryFiles(activeTokens, true, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
+				if err := UploadDirectoryFiles(activeTokens, true, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 轮询上传中断: %v\n", err)
 				}
 			} else {
 				fmt.Printf("📂 开始多 Bot 独立完全上传 (共 %d 个 Bot)...\n", len(activeTokens))
 				for i, t := range activeTokens {
 					fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
-					if err := UploadDirectoryFiles([]string{t}, false, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
+					if err := UploadDirectoryFiles([]string{t}, false, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 						fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
 					}
 				}

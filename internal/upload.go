@@ -133,6 +133,11 @@ func scanAndCollectDirPaths(targetPath string, baseTitle string) ([]DirTask, err
 		for _, subDir := range subDirs {
 			subPath := filepath.Join(currentPath, subDir.Name())
 			subTitle := currentTitle + "/" + subDir.Name()
+			if currentTitle == "" {
+				subTitle = ""
+			} else if currentTitle == "__use_file_name__" {
+				subTitle = "__use_file_name__"
+			}
 			if err := scan(subPath, subTitle, level+1); err != nil {
 				return err
 			}
@@ -331,39 +336,91 @@ func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool
 	return ch
 }
 
+func askForTitleRule() int {
+	fmt.Println("\n❓ 请选择标题命名规则 (5秒内无输入默认选择 0):")
+	fmt.Println("  1. 使用二级目录名称作为标题 (child-dir-name)")
+	fmt.Println("  2. 使用文件名作为标题 (file-name)")
+	fmt.Println("  3. 自定义输入标题 (input-name)")
+	fmt.Println("  0. 不设置标题 (默认)")
+	fmt.Print("请输入选项数字 [0-3]: ")
+
+	ch := make(chan string, 1)
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		ch <- strings.TrimSpace(input)
+	}()
+
+	select {
+	case res := <-ch:
+		switch res {
+		case "1":
+			return 1
+		case "2":
+			return 2
+		case "3":
+			return 3
+		default:
+			return 0
+		}
+	case <-time.After(5 * time.Second):
+		fmt.Println("\n⏰ 5秒超时无输入，已默认选择 0。")
+		return 0
+	}
+}
+
+func getDisplayTitleBase(titleBase string) string {
+	if titleBase == "__use_file_name__" {
+		return "[使用文件名]"
+	}
+	if titleBase == "" {
+		return "[不设置标题]"
+	}
+	return titleBase
+}
+
 // UploadDirectoryFiles 读取 targetPath 下的多层文件并上传到指定频道
-func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
+func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, isTitleSpecified bool, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
 		return fmt.Errorf("路径不存在或无法访问: %w", err)
 	}
 
+	// 确定标题规则
+	titleRule := 0 // 默认不设置标题
+	customInputTitle := ""
+
+	if isTitleSpecified {
+		titleRule = 3
+		customInputTitle = uploadTitle
+	} else if debugMode == "" || debugMode == "list" || debugMode == "curl" {
+		titleRule = askForTitleRule()
+		if titleRule == 3 {
+			fmt.Print("📝 请输入自定义标题: ")
+			reader := bufio.NewReader(os.Stdin)
+			input, _ := reader.ReadString('\n')
+			customInputTitle = strings.TrimSpace(input)
+			if customInputTitle == "" {
+				fmt.Println("⚠️  输入为空，自动选择 0 (不设置标题)。")
+				titleRule = 0
+			}
+		}
+	}
+
 	var allDirTasks []DirTask
 
 	if !fileInfo.IsDir() {
 		// 单文件支持
-		baseTitle := strings.TrimSuffix(filepath.Base(cleanPath), filepath.Ext(cleanPath))
-		if uploadTitle != "" {
-			baseTitle = uploadTitle
-		} else {
-			// 如果没有传 --title 参数
-			// 仅当没有启用 -r 参数，且为单个文件时，进行提示询问
-			if !useRRotation && (debugMode == "" || debugMode == "list" || debugMode == "curl") {
-				fmt.Printf("❓ 是否使用文件名作为标题？[Y/n] (输入 n 可自定义输入标题): ")
-				reader := bufio.NewReader(os.Stdin)
-				input, _ := reader.ReadString('\n')
-				input = strings.TrimSpace(strings.ToLower(input))
-
-				if input == "n" || input == "no" {
-					fmt.Print("📝 请输入自定义标题: ")
-					customTitle, _ := reader.ReadString('\n')
-					customTitle = strings.TrimSpace(customTitle)
-					if customTitle != "" {
-						baseTitle = customTitle
-					}
-				}
-			}
+		baseTitle := ""
+		switch titleRule {
+		case 1, 2:
+			// 单文件时使用文件名
+			baseTitle = strings.TrimSuffix(filepath.Base(cleanPath), filepath.Ext(cleanPath))
+		case 3:
+			baseTitle = customInputTitle
+		case 0:
+			baseTitle = ""
 		}
 
 		allDirTasks = []DirTask{
@@ -386,103 +443,77 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			}
 		}
 
-		if len(secondLevelDirs) == 0 {
-			baseTitle := filepath.Base(cleanPath)
-			if uploadTitle != "" {
-				baseTitle = uploadTitle
-			} else if debugMode == "" || debugMode == "list" || debugMode == "curl" {
-				fmt.Printf("❓ 目标目录 '%s' 下没有二级子目录。是否使用该目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ", baseTitle)
-				reader := bufio.NewReader(os.Stdin)
-				input, _ := reader.ReadString('\n')
-				input = strings.TrimSpace(strings.ToLower(input))
-
-				if input == "n" || input == "no" {
-					fmt.Print("📝 请输入自定义标题: ")
-					customTitle, _ := reader.ReadString('\n')
-					customTitle = strings.TrimSpace(customTitle)
-					if customTitle != "" {
-						baseTitle = customTitle
-					}
-				}
+		// 检查 cleanPath 目录下是否直接含有媒体文件
+		hasDirectMediaFiles := false
+		for _, entry := range entries {
+			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && isMediaFile(entry.Name()) {
+				hasDirectMediaFiles = true
+				break
 			}
+		}
 
-			tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, baseTitle)
+		if len(secondLevelDirs) == 0 {
+			rootTitleBase := ""
+			switch titleRule {
+			case 1:
+				rootTitleBase = filepath.Base(cleanPath)
+			case 2:
+				rootTitleBase = "__use_file_name__"
+			case 3:
+				rootTitleBase = customInputTitle
+			case 0:
+				rootTitleBase = ""
+			}
+			tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, rootTitleBase)
 			if err != nil {
 				return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
 			}
 			allDirTasks = append(allDirTasks, tasksForThisDir...)
 		} else {
-			// 2. 询问用户标题逻辑
-			var secondLevelBaseTitles []string
-			if debugMode == "" || debugMode == "list" || debugMode == "curl" {
-				if uploadTitle != "" {
-					// 如果命令行显式传入了 --title
-					if len(secondLevelDirs) == 1 {
-						secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-					} else {
-						for idx := range secondLevelDirs {
-							if idx == 0 {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-							} else {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
-							}
-						}
-					}
-				} else {
-					fmt.Print("❓ 是否使用二级目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ")
-					reader := bufio.NewReader(os.Stdin)
-					input, _ := reader.ReadString('\n')
-					input = strings.TrimSpace(strings.ToLower(input))
-
-					if input == "n" || input == "no" {
-						fmt.Print("📝 请输入自定义标题: ")
-						customTitle, _ := reader.ReadString('\n')
-						customTitle = strings.TrimSpace(customTitle)
-						if customTitle == "" {
-							fmt.Println("⚠️  输入为空，自动回退使用各二级目录名称。")
-							for _, d := range secondLevelDirs {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
-							}
-						} else {
-							if len(secondLevelDirs) == 1 {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
-							} else {
-								for idx := range secondLevelDirs {
-									if idx == 0 {
-										secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
-									} else {
-										secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", customTitle, idx+1))
-									}
-								}
-							}
-						}
-					} else {
-						for _, d := range secondLevelDirs {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
-						}
-					}
+			if hasDirectMediaFiles {
+				rootTitleBase := ""
+				switch titleRule {
+				case 1:
+					rootTitleBase = filepath.Base(cleanPath)
+				case 2:
+					rootTitleBase = "__use_file_name__"
+				case 3:
+					rootTitleBase = customInputTitle
+				case 0:
+					rootTitleBase = ""
 				}
-			} else {
-				if uploadTitle != "" {
-					if len(secondLevelDirs) == 1 {
-						secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-					} else {
-						for idx := range secondLevelDirs {
-							if idx == 0 {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-							} else {
-								secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
-							}
-						}
-					}
-				} else {
-					for _, d := range secondLevelDirs {
-						secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
-					}
-				}
+				allDirTasks = append(allDirTasks, DirTask{
+					Path:      cleanPath,
+					TitleBase: rootTitleBase,
+				})
 			}
 
-			// 3. 极速探测各二级目录及子目录下的结构树，仅扫描路径不读取文件大属性
+			// 为每个二级子目录计算 TitleBase
+			var secondLevelBaseTitles []string
+			for idx, d := range secondLevelDirs {
+				titleForThisDir := ""
+				switch titleRule {
+				case 1:
+					titleForThisDir = d.Name()
+				case 2:
+					titleForThisDir = "__use_file_name__"
+				case 3:
+					if len(secondLevelDirs) == 1 {
+						titleForThisDir = customInputTitle
+					} else {
+						if idx == 0 {
+							titleForThisDir = customInputTitle
+						} else {
+							titleForThisDir = fmt.Sprintf("%s_%d", customInputTitle, idx+1)
+						}
+					}
+				case 0:
+					titleForThisDir = ""
+				}
+				secondLevelBaseTitles = append(secondLevelBaseTitles, titleForThisDir)
+			}
+
+			// 极速探测各二级目录及子目录下的结构树，并生成任务
 			for idx, d := range secondLevelDirs {
 				subDirPath := filepath.Join(cleanPath, d.Name())
 				baseTitleForThisDir := secondLevelBaseTitles[idx]
@@ -505,7 +536,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	if debugMode == "list" {
 		fmt.Printf("📂 [DEBUG 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录任务, 分组大小: %d)\n", cleanPath, len(allDirTasks), groupSize)
 		for _, task := range allDirTasks {
-			fmt.Printf("\n🔍 正在读取目录: %s (对应标题前缀: %s)\n", task.Path, task.TitleBase)
+			fmt.Printf("\n🔍 正在读取目录: %s (对应标题前缀: %s)\n", task.Path, getDisplayTitleBase(task.TitleBase))
 			
 			rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 			if err != nil {
@@ -569,6 +600,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				totalBatchesForGroup := len(batches)
 				for _, batchFiles := range batches {
 					batchTitle := task.TitleBase
+					if task.TitleBase == "__use_file_name__" && len(batchFiles) > 0 {
+						firstFile := batchFiles[0].name
+						batchTitle = strings.TrimSuffix(firstFile, filepath.Ext(firstFile))
+					}
 					isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
 					if !isSingleGroup {
 						batchTitle += fmt.Sprintf("（%d）", groupNum)
@@ -615,7 +650,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 		tokenIdx := 0
 		for _, task := range allDirTasks {
-			fmt.Printf("\n🔍 正在读取目录: %s (标题前缀: %s)\n", task.Path, task.TitleBase)
+			fmt.Printf("\n🔍 正在读取目录: %s (标题前缀: %s)\n", task.Path, getDisplayTitleBase(task.TitleBase))
 			
 			rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 			if err != nil {
@@ -684,6 +719,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 					// 拼装标题
 					batchTitle := task.TitleBase
+					if task.TitleBase == "__use_file_name__" && len(batchFiles) > 0 {
+						firstFile := batchFiles[0].name
+						batchTitle = strings.TrimSuffix(firstFile, filepath.Ext(firstFile))
+					}
 					isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
 					if !isSingleGroup {
 						batchTitle += fmt.Sprintf("（%d）", groupNum)
@@ -790,7 +829,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	count := 0
 
 	for idx, task := range allDirTasks {
-		fmt.Printf("\n🔍 [%d/%d] 正在读取目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+		fmt.Printf("\n🔍 [%d/%d] 正在读取目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, getDisplayTitleBase(task.TitleBase))
 		
 		rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 		if err != nil {
@@ -849,6 +888,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			for subBatchIdx, batch := range batches {
 				// 拼装这组的标题
 				batchTitle := task.TitleBase
+				if task.TitleBase == "__use_file_name__" && len(batch) > 0 {
+					firstFile := batch[0].name
+					batchTitle = strings.TrimSuffix(firstFile, filepath.Ext(firstFile))
+				}
 				isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
 				if !isSingleGroup {
 					batchTitle += fmt.Sprintf("（%d）", groupNum)
@@ -1535,9 +1578,16 @@ func needTranscode(filePath string, ext string, meta MediaMetadata) bool {
 	if vCodec != "h264" && vCodec != "h265" && vCodec != "hevc" {
 		return true
 	}
-	// 3. 如果音频编码存在但不是 aac，必转
+	// 3. 如果音频编码存在但不是 aac，且不是苹果常见的免转码音频格式（针对 mov 容器豁免），必转
 	aCodec := strings.ToLower(meta.AudioCodec)
 	if aCodec != "" && aCodec != "aac" {
+		if ext == ".mov" {
+			switch aCodec {
+			case "pcm_s16le", "pcm_s24le", "alac", "lpcm":
+				// 苹果设备原生常见的高质量音轨编码，免转码直传
+				return false
+			}
+		}
 		return true
 	}
 	return false
