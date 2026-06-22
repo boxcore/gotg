@@ -73,7 +73,7 @@ func parseTokens() []string {
 var RootCmd = &cobra.Command{
 	Use:     "gotg",
 	Short:   "gotg 是一个 Telegram Bot 运维及媒体辅助工具",
-	Version: "v0.1.2",
+	Version: "v0.1.3",
 	Run: func(cmd *cobra.Command, args []string) {
 		// 💡 如果命令行没有传递 Flag，则从环境变量中 Fallback
 		if tokenStr == "" {
