@@ -64,6 +64,14 @@ type uploadFile struct {
 	metadata    MediaMetadata
 }
 
+type rawFile struct {
+	path        string
+	name        string
+	size        int64
+	modTime     time.Time
+	createdTime time.Time
+}
+
 type DirTask struct {
 	Path      string
 	TitleBase string
@@ -137,18 +145,22 @@ func scanAndCollectDirPaths(targetPath string, baseTitle string) ([]DirTask, err
 	return tasks, err
 }
 
-func processSingleDir(dirPath string, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, sortType string) ([]uploadFile, error) {
+func processSingleDir(dirPath string, cacheDir string, forceUp bool, sortType string) ([]rawFile, error) {
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return nil, err
 	}
 
-	var files []uploadFile
+	var files []rawFile
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		if !isMediaFile(entry.Name()) {
 			continue
 		}
 
@@ -161,29 +173,21 @@ func processSingleDir(dirPath string, cacheDir string, cacheFresh bool, transcod
 		time.Sleep(100 * time.Millisecond)
 
 		filePath := filepath.Join(dirPath, entry.Name())
-		meta, err := processMedia(filePath, info, cacheDir, cacheFresh, transcode, forceUp)
-		if err != nil {
-			fmt.Printf("⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", entry.Name(), err)
-			continue
+		createdTime := getBirthTime(info)
+		sha1Val := calculateSHA1(entry.Name(), createdTime, info.ModTime(), info.Size())
+
+		if !forceUp {
+			if isSuccessInCache(cacheDir, sha1Val) {
+				continue
+			}
 		}
 
-		if meta.FileType == "other" {
-			fmt.Printf("ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", entry.Name())
-			continue
-		}
-
-		if !forceUp && meta.UploadStatus == "success" {
-			fmt.Printf("ℹ️  文件已上传成功，自动跳过: %s\n", entry.Name())
-			continue
-		}
-
-		files = append(files, uploadFile{
-			path:        meta.FilePath,
+		files = append(files, rawFile{
+			path:        filePath,
 			name:        entry.Name(),
-			size:        meta.FileSize,
-			modTime:     meta.ModTime,
-			createdTime: meta.CreatedTime,
-			metadata:    meta,
+			size:        info.Size(),
+			modTime:     info.ModTime(),
+			createdTime: createdTime,
 		})
 	}
 
@@ -335,52 +339,100 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	// 4. 调试模式：list
 	if debugMode == "list" {
 		fmt.Printf("📂 [DEBUG 模式] 扫描目录: %s (共找到 %d 个包含待上传媒体的目录任务, 分组大小: %d)\n", cleanPath, len(allDirTasks), groupSize)
-		for idx, task := range allDirTasks {
-			fmt.Printf("\n🔍 正在读取并预处理第 %d/%d 个目录: %s (对应标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+		for _, task := range allDirTasks {
+			fmt.Printf("\n🔍 正在读取目录: %s (对应标题前缀: %s)\n", task.Path, task.TitleBase)
 			
-			filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+			rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 			if err != nil {
-				fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+				fmt.Printf("❌ 读取目录 %s 失败: %v\n", task.Path, err)
 				continue
 			}
 
-			batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
-			if len(batches) == 0 {
+			totalRaw := len(rawFiles)
+			if totalRaw == 0 {
 				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 				continue
 			}
 
-			totalBatches := len(batches)
-			for batchIdx, batchFiles := range batches {
-				batchNum := batchIdx + 1
-				
-				// 拼装这组的标题
-				batchTitle := task.TitleBase
-				if totalBatches > 1 {
-					batchTitle += fmt.Sprintf("（%d）", batchNum)
+			currentIndex := 0
+			groupNum := 1
+
+			for currentIndex < totalRaw {
+				endIndex := currentIndex + groupSize
+				if endIndex > totalRaw {
+					endIndex = totalRaw
 				}
-				if uploadTag != "" {
-					batchTitle += "\n" + uploadTag
+				candidateRawFiles := rawFiles[currentIndex:endIndex]
+				currentIndex = endIndex
+
+				var processedFiles []uploadFile
+				for _, raw := range candidateRawFiles {
+					info, err := os.Stat(raw.path)
+					if err != nil {
+						continue
+					}
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
+					if err != nil {
+						continue
+					}
+					if meta.FileType == "other" {
+						continue
+					}
+					if !forceUp && meta.UploadStatus == "success" {
+						continue
+					}
+
+					processedFiles = append(processedFiles, uploadFile{
+						path:        meta.FilePath,
+						name:        raw.name,
+						size:        meta.FileSize,
+						modTime:     meta.ModTime,
+						createdTime: meta.CreatedTime,
+						metadata:    meta,
+					})
 				}
 
-				fmt.Printf("  📦 [组 %d/%d] 发送标题为:\n\"\"\"\n%s\n\"\"\"\n", batchNum, totalBatches, batchTitle)
-				for fileIdx, f := range batchFiles {
-					details := ""
-					if f.metadata.FileType == "video" {
-						details = fmt.Sprintf("时长: %.1fs, 比例: %s", f.metadata.Duration, f.metadata.AspectRatio)
-					} else if f.metadata.FileType == "image" {
-						details = fmt.Sprintf("分辨率: %s", f.metadata.Resolution)
-						if f.metadata.GeoInfo != "" {
-							details += fmt.Sprintf(", 地理信息: [%s]", f.metadata.GeoInfo)
+				if len(processedFiles) == 0 {
+					continue
+				}
+
+				batches := splitIntoBatches(processedFiles, groupSize, apiURL)
+				if len(batches) == 0 {
+					continue
+				}
+
+				totalBatchesForGroup := len(batches)
+				for _, batchFiles := range batches {
+					batchTitle := task.TitleBase
+					isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
+					if !isSingleGroup {
+						batchTitle += fmt.Sprintf("（%d）", groupNum)
+					}
+					groupNum++
+
+					if uploadTag != "" {
+						batchTitle += "\n" + uploadTag
+					}
+
+					fmt.Printf("  📦 [模拟组] 发送标题为:\n\"\"\"\n%s\n\"\"\"\n", batchTitle)
+					for fileIdx, f := range batchFiles {
+						details := ""
+						if f.metadata.FileType == "video" {
+							details = fmt.Sprintf("时长: %.1fs, 比例: %s", f.metadata.Duration, f.metadata.AspectRatio)
+						} else if f.metadata.FileType == "image" {
+							details = fmt.Sprintf("分辨率: %s", f.metadata.Resolution)
+							if f.metadata.GeoInfo != "" {
+								details += fmt.Sprintf(", 地理信息: [%s]", f.metadata.GeoInfo)
+							}
 						}
+						if f.metadata.TranPath != "" {
+							details += ", [已自适应转码压缩]"
+						}
+						if details != "" {
+							details = " (" + details + ")"
+						}
+						fmt.Printf("    ├─ %d. %s (%s)%s\n", fileIdx+1, f.name, formatSize(f.size), details)
 					}
-					if f.metadata.TranPath != "" {
-						details += ", [已自适应转码压缩]"
-					}
-					if details != "" {
-						details = " (" + details + ")"
-					}
-					fmt.Printf("    ├─ %d. %s (%s)%s\n", fileIdx+1, f.name, formatSize(f.size), details)
 				}
 			}
 		}
@@ -397,119 +449,156 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		}
 
 		tokenIdx := 0
-		for idx, task := range allDirTasks {
-			fmt.Printf("\n🔍 正在读取并预处理第 %d/%d 个目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+		for _, task := range allDirTasks {
+			fmt.Printf("\n🔍 正在读取目录: %s (标题前缀: %s)\n", task.Path, task.TitleBase)
 			
-			filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+			rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 			if err != nil {
-				fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+				fmt.Printf("❌ 读取目录 %s 失败: %v\n", task.Path, err)
 				continue
 			}
 
-			batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
-			if len(batches) == 0 {
+			totalRaw := len(rawFiles)
+			if totalRaw == 0 {
 				fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 				continue
 			}
 
-			totalBatches := len(batches)
-			for batchIdx, batchFiles := range batches {
-				batchNum := batchIdx + 1
+			currentIndex := 0
+			groupNum := 1
 
-				// 计算 Token
-				currToken := tokens[tokenIdx]
-				apiEndpoint := fmt.Sprintf("%s/bot%s/sendMediaGroup", baseAPI, currToken)
-
-				// 拼装标题
-				batchTitle := task.TitleBase
-				if totalBatches > 1 {
-					batchTitle += fmt.Sprintf("（%d）", batchNum)
+			for currentIndex < totalRaw {
+				endIndex := currentIndex + groupSize
+				if endIndex > totalRaw {
+					endIndex = totalRaw
 				}
-				if uploadTag != "" {
-					batchTitle += "\n" + uploadTag
+				candidateRawFiles := rawFiles[currentIndex:endIndex]
+				currentIndex = endIndex
+
+				var processedFiles []uploadFile
+				for _, raw := range candidateRawFiles {
+					info, err := os.Stat(raw.path)
+					if err != nil {
+						continue
+					}
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
+					if err != nil {
+						continue
+					}
+					if meta.FileType == "other" {
+						continue
+					}
+					if !forceUp && meta.UploadStatus == "success" {
+						continue
+					}
+
+					processedFiles = append(processedFiles, uploadFile{
+						path:        meta.FilePath,
+						name:        raw.name,
+						size:        meta.FileSize,
+						modTime:     meta.ModTime,
+						createdTime: meta.CreatedTime,
+						metadata:    meta,
+					})
 				}
 
-				fmt.Printf("\n📦 [组 %d/%d] (文件数: %d) Token: %s curl 命令模拟:\n", batchNum, totalBatches, len(batchFiles), maskToken(currToken))
+				if len(processedFiles) == 0 {
+					continue
+				}
 
-				var mediaItems []string
-				var filesFields []string
-				for mediaIdx, f := range batchFiles {
-					attachName := fmt.Sprintf("file%d", mediaIdx)
-					uploadPath := f.path
-					if f.metadata.TranPath != "" {
-						uploadPath = f.metadata.TranPath
+				batches := splitIntoBatches(processedFiles, groupSize, apiURL)
+				if len(batches) == 0 {
+					continue
+				}
+
+				totalBatchesForGroup := len(batches)
+				for subBatchIdx, batchFiles := range batches {
+					// 计算 Token
+					currToken := tokens[tokenIdx]
+					apiEndpoint := fmt.Sprintf("%s/bot%s/sendMediaGroup", baseAPI, currToken)
+
+					// 拼装标题
+					batchTitle := task.TitleBase
+					isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
+					if !isSingleGroup {
+						batchTitle += fmt.Sprintf("（%d）", groupNum)
+					}
+					groupNum++
+
+					if uploadTag != "" {
+						batchTitle += "\n" + uploadTag
 					}
 
-					// 仅给媒体组的第一个文件设置 caption
-					escapedCaption := ""
-					if mediaIdx == 0 {
-						escapedCaption = strings.ReplaceAll(batchTitle, "\n", "\\n")
-						escapedCaption = strings.ReplaceAll(escapedCaption, `"`, `\"`)
-					}
+					fmt.Printf("\n📦 [组模拟] (文件数: %d) Token: %s curl 命令模拟:\n", len(batchFiles), maskToken(currToken))
 
-					captionPart := ""
-					if escapedCaption != "" {
-						captionPart = fmt.Sprintf(`,
-         \"caption\": \"%s\"`, escapedCaption)
-					}
+					var mediaItems []string
+					var filesFields []string
+					for mediaIdx, f := range batchFiles {
+						attachName := fmt.Sprintf("file%d", mediaIdx)
+						uploadPath := f.path
+						if f.metadata.TranPath != "" {
+							uploadPath = f.metadata.TranPath
+						}
 
-					if f.metadata.FileType == "video" {
-						thumbAttachName := fmt.Sprintf("thumb_video%d", mediaIdx)
-						mediaItems = append(mediaItems, fmt.Sprintf(`       {
-         \"type\": \"video\",
-         \"media\": \"attach://%s\",
-         \"width\": %d,
-         \"height\": %d,
-         \"duration\": %.0f,
-         \"supports_streaming\": true,
-         \"thumb\": \"attach://%s\"%s
-       }`, attachName, f.metadata.Width, f.metadata.Height, f.metadata.Duration, thumbAttachName, captionPart))
+						escapedCaption := ""
+						if mediaIdx == 0 {
+							escapedCaption = strings.ReplaceAll(batchTitle, "\n", "\\n")
+							escapedCaption = strings.ReplaceAll(escapedCaption, `"`, `\"`)
+						}
 
-						filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, thumbAttachName, f.metadata.ThumbPath))
-						filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, attachName, uploadPath))
-					} else if f.metadata.FileType == "image" {
-						mediaItems = append(mediaItems, fmt.Sprintf(`       {
-         \"type\": \"photo\",
-         \"media\": \"attach://%s\"%s
-       }`, attachName, captionPart))
+						captionPart := ""
+						if escapedCaption != "" {
+							captionPart = fmt.Sprintf(`,
+          \"caption\": \"%s\"`, escapedCaption)
+						}
 
-						filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, attachName, uploadPath))
-					} else {
-						// 其他文件降级使用 document 类型
-						if f.metadata.ThumbPath != "" {
-							thumbAttachName := fmt.Sprintf("thumb_doc%d", mediaIdx)
+						if f.metadata.FileType == "video" {
+							thumbAttachName := fmt.Sprintf("thumb_video%d", mediaIdx)
 							mediaItems = append(mediaItems, fmt.Sprintf(`       {
-         \"type\": \"document\",
-         \"media\": \"attach://%s\",
-         \"thumb\": \"attach://%s\"%s
-       }`, attachName, thumbAttachName, captionPart))
+          \"type\": \"video\",
+          \"media\": \"attach://%s\",
+          \"width\": %d,
+          \"height\": %d,
+          \"duration\": %.0f,
+          \"supports_streaming\": true,
+          \"thumb\": \"attach://%s\"%s
+        }`, attachName, f.metadata.Width, f.metadata.Height, f.metadata.Duration, thumbAttachName, captionPart))
+
 							filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, thumbAttachName, f.metadata.ThumbPath))
 							filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, attachName, uploadPath))
-						} else {
+						} else if f.metadata.FileType == "image" {
 							mediaItems = append(mediaItems, fmt.Sprintf(`       {
-         \"type\": \"document\",
-         \"media\": \"attach://%s\"%s
-       }`, attachName, captionPart))
+          \"type\": \"photo\",
+          \"media\": \"attach://%s\"%s
+        }`, attachName, captionPart))
+
+							if f.metadata.ThumbPath != "" {
+								thumbAttachName := fmt.Sprintf("thumb_photo%d", mediaIdx)
+								filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, thumbAttachName, f.metadata.ThumbPath))
+							}
+							filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, attachName, uploadPath))
+						} else {
 							filesFields = append(filesFields, fmt.Sprintf(`     -F "%s=@%s"`, attachName, uploadPath))
 						}
 					}
-				}
 
-				mediaJSON := fmt.Sprintf("[\n%s\n     ]", strings.Join(mediaItems, ",\n"))
+					mediaJSON := fmt.Sprintf("[\n%s\n     ]", strings.Join(mediaItems, ",\n"))
 
-				fmt.Println("```bash")
-				fmt.Printf("curl -X POST %q \\\n", apiEndpoint)
-				fmt.Printf("     -F \"chat_id=%s\" \\\n", chatIDStr)
-				fmt.Printf("     -F \"media=%s\" \\\n", mediaJSON)
-				fmt.Println(strings.Join(filesFields, " \\\n"))
-				fmt.Println("```")
+					fmt.Println("```bash")
+					fmt.Printf("curl -X POST %q \\\n", apiEndpoint)
+					fmt.Printf("     -F \"chat_id=%s\" \\\n", chatIDStr)
+					fmt.Printf("     -F \"media=%s\" \\\n", mediaJSON)
+					fmt.Println(strings.Join(filesFields, " \\\n"))
+					fmt.Println("```")
 
-				if useRRotation && len(tokens) > 1 {
-					tokenIdx = (tokenIdx + 1) % len(tokens)
-				}
+					if useRRotation && len(tokens) > 1 {
+						tokenIdx = (tokenIdx + 1) % len(tokens)
+					}
 
-				if batchIdx < totalBatches - 1 {
-					fmt.Printf("💤 [CURL 模式] 每组输出后模拟休眠 %d 秒...\n", sleepTime)
+					isLastBatchOverall := (currentIndex >= totalRaw && subBatchIdx == totalBatchesForGroup-1)
+					if !isLastBatchOverall {
+						fmt.Printf("💤 [CURL 模式] 每组输出后模拟休眠 %d 秒...\n", sleepTime)
+					}
 				}
 			}
 		}
@@ -536,185 +625,242 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	count := 0
 
 	for idx, task := range allDirTasks {
-		fmt.Printf("\n🔍 [%d/%d] 正在读取并预处理目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
+		fmt.Printf("\n🔍 [%d/%d] 正在读取目录: %s (标题前缀: %s)\n", idx+1, len(allDirTasks), task.Path, task.TitleBase)
 		
-		filesToUpload, err := processSingleDir(task.Path, cacheDir, cacheFresh, transcode, forceUp, sortType)
+		rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 		if err != nil {
-			fmt.Printf("❌ 预处理目录 %s 失败: %v\n", task.Path, err)
+			fmt.Printf("❌ 读取目录 %s 失败: %v\n", task.Path, err)
 			continue
 		}
 
-		batches := splitIntoBatches(filesToUpload, groupSize, apiURL)
-		totalBatches := len(batches)
-		if totalBatches == 0 {
+		totalRaw := len(rawFiles)
+		if totalRaw == 0 {
 			fmt.Println("  ℹ️  该目录下无可上传媒体文件或已全部上传成功。")
 			continue
 		}
 
-		fmt.Printf("📂 开始上传该目录，共 %d 个待上传文件 (已智能拆分为 %d 个媒体组)\n", countFiles(batches), totalBatches)
+		fmt.Printf("📂 该目录下共找到 %d 个待上传文件，正在按分包大小 (最多 %d) 逐步预处理并上传...\n", totalRaw, groupSize)
 
-		for batchIdx, batch := range batches {
-			batchNum := batchIdx + 1
+		currentIndex := 0
+		groupNum := 1
 
-			// 切换 Bot
-			bot := bots[tokenIdx]
-			token := tokens[tokenIdx]
-
-			var totalBytes int64
-			for _, f := range batch {
-				totalBytes += f.size
+		for currentIndex < totalRaw {
+			endIndex := currentIndex + groupSize
+			if endIndex > totalRaw {
+				endIndex = totalRaw
 			}
+			candidateRawFiles := rawFiles[currentIndex:endIndex]
+			currentIndex = endIndex
 
-			// 拼装这组的标题
-			batchTitle := task.TitleBase
-			if totalBatches > 1 {
-				batchTitle += fmt.Sprintf("（%d）", batchNum)
-			}
-			if uploadTag != "" {
-				batchTitle += "\n" + uploadTag
-			}
+			// 预处理这 10 个候选文件
+			var processedFiles []uploadFile
+			for _, raw := range candidateRawFiles {
+				// 慢速处理以太密集 API 限制，每文件间隔 100ms
+				time.Sleep(100 * time.Millisecond)
 
-			fmt.Printf("🚀 正在以媒体组上传 %d 个文件 (使用 Bot Token: %s)...\n", len(batch), maskToken(token))
-
-			var uploadedBytes int64
-			var currentFile string
-			var mu sync.Mutex
-
-			var openFiles []*os.File
-			var mediaList []telego.InputMedia
-			var openErr error
-
-			for mediaIdx, f := range batch {
-				uploadPath := f.path
-				if f.metadata.TranPath != "" {
-					uploadPath = f.metadata.TranPath
-					fmt.Printf("  ⚠️  原图规格超限，已自动切换为转码图: %s\n", filepath.Base(uploadPath))
-				}
-
-				// 仅给媒体组的第一个文件设置 Caption
-				caption := ""
-				if mediaIdx == 0 {
-					caption = batchTitle
-				}
-
-				fmt.Printf("  ├─ 准备文件: %s (%s)\n", f.name, formatSize(f.size))
-				fileHandle, err := os.Open(uploadPath)
+				info, err := os.Stat(raw.path)
 				if err != nil {
-					openErr = err
-					fmt.Printf("  ❌ 打开文件失败: %v\n", err)
-					break
-				}
-				openFiles = append(openFiles, fileHandle)
-
-				var reader telegoapi.NamedReader = fileHandle
-				if debugMode == "" {
-					reader = &ProgressNamedReader{
-						Reader: fileHandle,
-						name:   filepath.Base(uploadPath),
-						onRead: func(n int) {
-							mu.Lock()
-							uploadedBytes += int64(n)
-							currentFile = f.name
-							drawProgressBar(uploadedBytes, totalBytes, currentFile)
-							mu.Unlock()
-						},
-					}
+					fmt.Printf("  ⚠️  文件不可达 (%s): %v，跳过\n", raw.name, err)
+					continue
 				}
 
-				if f.metadata.FileType == "video" {
-					doc := &telego.InputMediaVideo{
-						Type:              "video",
-						Media:             telego.InputFile{File: reader},
-						Width:             f.metadata.Width,
-						Height:            f.metadata.Height,
-						Duration:          int(f.metadata.Duration),
-						SupportsStreaming: true,
-						Caption:           caption,
-					}
-					if f.metadata.ThumbPath != "" {
-						thumbHandle, err := os.Open(f.metadata.ThumbPath)
-						if err != nil {
-							fmt.Printf("  ⚠️  打开视频缩略图失败: %v\n", err)
-						} else {
-							openFiles = append(openFiles, thumbHandle)
-							doc.Thumbnail = &telego.InputFile{File: thumbHandle}
-						}
-					}
-					mediaList = append(mediaList, doc)
-
-				} else if f.metadata.FileType == "image" {
-					doc := &telego.InputMediaPhoto{
-						Type:    "photo",
-						Media:   telego.InputFile{File: reader},
-						Caption: caption,
-					}
-					mediaList = append(mediaList, doc)
-
-				} else {
-					doc := &telego.InputMediaDocument{
-						Type:    "document",
-						Media:   telego.InputFile{File: reader},
-						Caption: caption,
-					}
-					if f.metadata.ThumbPath != "" {
-						thumbHandle, err := os.Open(f.metadata.ThumbPath)
-						if err != nil {
-							fmt.Printf("  ⚠️  打开文档缩略图失败: %v\n", err)
-						} else {
-							openFiles = append(openFiles, thumbHandle)
-							doc.Thumbnail = &telego.InputFile{File: thumbHandle}
-						}
-					}
-					mediaList = append(mediaList, doc)
+				meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
+				if err != nil {
+					fmt.Printf("  ⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", raw.name, err)
+					continue
 				}
+
+				if meta.FileType == "other" {
+					fmt.Printf("  ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", raw.name)
+					continue
+				}
+
+				if !forceUp && meta.UploadStatus == "success" {
+					fmt.Printf("  ℹ️  文件已上传成功，自动跳过: %s\n", raw.name)
+					continue
+				}
+
+				processedFiles = append(processedFiles, uploadFile{
+					path:        meta.FilePath,
+					name:        raw.name,
+					size:        meta.FileSize,
+					modTime:     meta.ModTime,
+					createdTime: meta.CreatedTime,
+					metadata:    meta,
+				})
 			}
 
-			if openErr != nil {
-				for _, fh := range openFiles {
-					_ = fh.Close()
-				}
-				fmt.Println("❌ 上传组失败: 无法打开部分文件")
+			if len(processedFiles) == 0 {
 				continue
 			}
 
-			// 发送媒体组
-			_, err = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
-				ChatID: chatID,
-				Media:  mediaList,
-			})
-
-			for _, fh := range openFiles {
-				_ = fh.Close()
+			batches := splitIntoBatches(processedFiles, groupSize, apiURL)
+			if len(batches) == 0 {
+				continue
 			}
 
-			if debugMode == "" {
-				fmt.Println()
-			}
-
-			if err != nil {
-				fmt.Printf("❌ 媒体组上传失败: %v\n", err)
-				for _, f := range batch {
-					updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
+			totalBatchesForGroup := len(batches)
+			for subBatchIdx, batch := range batches {
+				// 拼装这组的标题
+				batchTitle := task.TitleBase
+				isSingleGroup := (totalRaw <= groupSize && totalBatchesForGroup == 1)
+				if !isSingleGroup {
+					batchTitle += fmt.Sprintf("（%d）", groupNum)
 				}
-			} else {
-				fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
-				count += len(batch)
-				for _, f := range batch {
-					updateCacheStatus(cacheDir, f.metadata.SHA1, "success")
-					cleanTranscodeFiles(cacheDir, f.metadata)
+				groupNum++
+
+				if uploadTag != "" {
+					batchTitle += "\n" + uploadTag
 				}
-			}
 
-			// 切换 Bot Token
-			if useRRotation && len(bots) > 1 {
-				tokenIdx = (tokenIdx + 1) % len(bots)
-				fmt.Printf("🔄 轮询模式：切换到下一个 Bot (Token: %s)\n", maskToken(tokens[tokenIdx]))
-			}
+				// 切换 Bot
+				bot := bots[tokenIdx]
+				token := tokens[tokenIdx]
 
-			// 休眠
-			if batchIdx < totalBatches - 1 || (useRRotation && len(bots) > 1) {
-				fmt.Printf("💤 已完成该媒体组处理，根据设置休眠 %d 秒以防止 API 频控/风控...\n", sleepTime)
-				time.Sleep(time.Duration(sleepTime) * time.Second)
+				var totalBytes int64
+				for _, f := range batch {
+					totalBytes += f.size
+				}
+
+				fmt.Printf("🚀 正在以媒体组上传 %d 个文件 (使用 Bot Token: %s)...\n", len(batch), maskToken(token))
+
+				var uploadedBytes int64
+				var currentFile string
+				var mu sync.Mutex
+
+				var openFiles []*os.File
+				var mediaList []telego.InputMedia
+				var openErr error
+
+				for mediaIdx, f := range batch {
+					uploadPath := f.path
+					if f.metadata.TranPath != "" {
+						uploadPath = f.metadata.TranPath
+						fmt.Printf("  ⚠️  原图规格超限，已自动切换为转码图: %s\n", filepath.Base(uploadPath))
+					}
+
+					caption := ""
+					if mediaIdx == 0 {
+						caption = batchTitle
+					}
+
+					fmt.Printf("  ├─ 准备文件: %s (%s)\n", f.name, formatSize(f.size))
+					fileHandle, err := os.Open(uploadPath)
+					if err != nil {
+						openErr = err
+						fmt.Printf("  ❌ 打开文件失败: %v\n", err)
+						break
+					}
+					openFiles = append(openFiles, fileHandle)
+
+					var reader telegoapi.NamedReader = fileHandle
+					if debugMode == "" {
+						reader = &ProgressNamedReader{
+							Reader: fileHandle,
+							name:   filepath.Base(uploadPath),
+							onRead: func(n int) {
+								mu.Lock()
+								uploadedBytes += int64(n)
+								currentFile = f.name
+								drawProgressBar(uploadedBytes, totalBytes, currentFile)
+								mu.Unlock()
+							},
+						}
+					}
+
+					if f.metadata.FileType == "video" {
+						doc := &telego.InputMediaVideo{
+							Type:              "video",
+							Media:             telego.InputFile{File: reader},
+							Width:             f.metadata.Width,
+							Height:            f.metadata.Height,
+							Duration:          int(f.metadata.Duration),
+							SupportsStreaming: true,
+							Caption:           caption,
+						}
+						if f.metadata.ThumbPath != "" {
+							thumbHandle, err := os.Open(f.metadata.ThumbPath)
+							if err != nil {
+								fmt.Printf("  ⚠️  打开视频缩略图失败: %v\n", err)
+							} else {
+								openFiles = append(openFiles, thumbHandle)
+								doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+							}
+						}
+						mediaList = append(mediaList, doc)
+
+					} else if f.metadata.FileType == "image" {
+						doc := &telego.InputMediaPhoto{
+							Type:    "photo",
+							Media:   telego.InputFile{File: reader},
+							Caption: caption,
+						}
+						mediaList = append(mediaList, doc)
+
+					} else {
+						doc := &telego.InputMediaDocument{
+							Type:    "document",
+							Media:   telego.InputFile{File: reader},
+							Caption: caption,
+						}
+						if f.metadata.ThumbPath != "" {
+							thumbHandle, err := os.Open(f.metadata.ThumbPath)
+							if err != nil {
+								fmt.Printf("  ⚠️  打开文档缩略图失败: %v\n", err)
+							} else {
+								openFiles = append(openFiles, thumbHandle)
+								doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+							}
+						}
+						mediaList = append(mediaList, doc)
+					}
+				}
+
+				if openErr != nil {
+					for _, fh := range openFiles {
+						_ = fh.Close()
+					}
+					fmt.Println("❌ 上传组失败: 无法打开部分文件")
+					continue
+				}
+
+				_, err = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
+					ChatID: chatID,
+					Media:  mediaList,
+				})
+
+				for _, fh := range openFiles {
+					_ = fh.Close()
+				}
+
+				if debugMode == "" {
+					fmt.Println()
+				}
+
+				if err != nil {
+					fmt.Printf("❌ 媒体组上传失败: %v\n", err)
+					for _, f := range batch {
+						updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
+					}
+				} else {
+					fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
+					count += len(batch)
+					for _, f := range batch {
+						updateCacheStatus(cacheDir, f.metadata.SHA1, "success")
+						cleanTranscodeFiles(cacheDir, f.metadata)
+					}
+				}
+
+				if useRRotation && len(bots) > 1 {
+					tokenIdx = (tokenIdx + 1) % len(bots)
+					fmt.Printf("🔄 轮询模式：切换到下一个 Bot (Token: %s)\n", maskToken(tokens[tokenIdx]))
+				}
+
+				isLastBatchOverall := (currentIndex >= totalRaw && subBatchIdx == totalBatchesForGroup-1)
+				if !isLastBatchOverall || (useRRotation && len(bots) > 1) {
+					fmt.Printf("💤 已完成该媒体组处理，根据设置休眠 %d 秒以防止 API 频控/风控...\n", sleepTime)
+					time.Sleep(time.Duration(sleepTime) * time.Second)
+				}
 			}
 		}
 	}
@@ -995,10 +1141,13 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 		}
 
 		if meta.FileType == "video" {
+			fmt.Printf("🎬 正在为视频生成缩略图: %s...\n", filepath.Base(meta.FilePath))
 			thumbPath := filepath.Join(cacheDir, sha1Val+"_thumb.jpg")
 			cmdThumb := exec.Command("ffmpeg", "-y", "-ss", "00:00:00", "-i", meta.FilePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-vframes", "1", "-q:v", "5", thumbPath)
 			if err := cmdThumb.Run(); err == nil {
 				meta.ThumbPath = thumbPath
+			} else {
+				fmt.Printf("⚠️  视频缩略图生成失败: %v\n", err)
 			}
 		}
 
@@ -1025,11 +1174,16 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 			meta.GeoInfo = geo
 		}
 
-		// C. ffmpeg 导出图片缩略图 (限制 320x320 JPEG)
-		thumbPath := filepath.Join(cacheDir, sha1Val+"_thumb.jpg")
-		cmdThumb := exec.Command("ffmpeg", "-y", "-i", filePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-q:v", "5", thumbPath)
-		if err := cmdThumb.Run(); err == nil {
-			meta.ThumbPath = thumbPath
+		// C. ffmpeg 导出图片缩略图 (限制 320x320 JPEG，且仅在图片体积超过 2MB 时生成)
+		if meta.FileSize > 2*1024*1024 {
+			fmt.Printf("🎨 正在为图片生成缩略图: %s (%s)...\n", filepath.Base(filePath), formatSize(meta.FileSize))
+			thumbPath := filepath.Join(cacheDir, sha1Val+"_thumb.jpg")
+			cmdThumb := exec.Command("ffmpeg", "-y", "-i", filePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-q:v", "5", thumbPath)
+			if err := cmdThumb.Run(); err == nil {
+				meta.ThumbPath = thumbPath
+			} else {
+				fmt.Printf("⚠️  图片缩略图生成失败: %v\n", err)
+			}
 		}
 
 		// D. 原图超限检测与转码压缩 (_tran.jpg)
@@ -1361,4 +1515,24 @@ func countFiles(batches [][]uploadFile) int {
 		total += len(b)
 	}
 	return total
+}
+
+func isSuccessInCache(cacheDir string, sha1Val string) bool {
+	jsonPath := filepath.Join(cacheDir, sha1Val+".json")
+	if cachedData, err := os.ReadFile(jsonPath); err == nil {
+		var meta MediaMetadata
+		if err := json.Unmarshal(cachedData, &meta); err == nil {
+			if meta.UploadStatus == "success" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isMediaFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	isPotentialVideoFile := (ext == ".mp4" || ext == ".mov" || ext == ".avi" || ext == ".mpeg" || ext == ".mpg" || ext == ".flv" || ext == ".m4v" || ext == ".ts" || ext == ".mkv" || ext == ".wmv" || ext == ".rmvb" || ext == ".3gp")
+	isImageFile := (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".webp")
+	return isPotentialVideoFile || isImageFile
 }
