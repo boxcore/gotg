@@ -1,0 +1,71 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BINARY_NAME="gotg"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="gotg.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" -o "$BINARY_NAME" cmd/gotg/main.go
+
+      - name: Package Release Asset
+        id: package
+        shell: bash
+        run: |
+          BINARY_NAME="gotg"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME="gotg.exe"
+          fi
+          
+          # 资产文件名打包
+          ARCHIVE_NAME="gotg-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${ARCHIVE_NAME}.zip" "$BINARY_NAME" README.md
+            echo "asset=${ARCHIVE_NAME}.zip" >> $GITHUB_OUTPUT
+          else
+            tar -czvf "${ARCHIVE_NAME}.tar.gz" "$BINARY_NAME" README.md
+            echo "asset=${ARCHIVE_NAME}.tar.gz" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.asset }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
