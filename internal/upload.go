@@ -218,8 +218,57 @@ func processSingleDir(dirPath string, cacheDir string, forceUp bool, sortType st
 	return files, nil
 }
 
+type prefetchResult struct {
+	processedFiles []uploadFile
+}
+
+func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int) <-chan prefetchResult {
+	ch := make(chan prefetchResult, 1)
+	go func() {
+		var processedFiles []uploadFile
+		for _, raw := range candidateRawFiles {
+			// 慢速处理以避免太密集的 API 限制，每文件间隔 100ms
+			time.Sleep(100 * time.Millisecond)
+
+			info, err := os.Stat(raw.path)
+			if err != nil {
+				fmt.Printf("  ⚠️  文件不可达 (%s): %v，跳过\n", raw.name, err)
+				continue
+			}
+
+			meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+			if err != nil {
+				fmt.Printf("  ⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", raw.name, err)
+				continue
+			}
+
+			if meta.FileType == "other" {
+				fmt.Printf("  ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", raw.name)
+				continue
+			}
+
+			if !forceUp && meta.UploadStatus == "success" {
+				fmt.Printf("  ℹ️  文件已上传成功，自动跳过: %s\n", raw.name)
+				continue
+			}
+
+			processedFiles = append(processedFiles, uploadFile{
+				path:        meta.FilePath,
+				name:        raw.name,
+				size:        meta.FileSize,
+				modTime:     meta.ModTime,
+				createdTime: meta.CreatedTime,
+				metadata:    meta,
+			})
+		}
+		ch <- prefetchResult{processedFiles: processedFiles}
+		close(ch)
+	}()
+	return ch
+}
+
 // UploadDirectoryFiles 读取 targetPath 下的多层文件并上传到指定频道
-func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, uploadTag string, forceUp bool, transcode bool) error {
+func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
@@ -371,7 +420,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					if err != nil {
 						continue
 					}
-					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
 					if err != nil {
 						continue
 					}
@@ -481,7 +530,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					if err != nil {
 						continue
 					}
-					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
 					if err != nil {
 						continue
 					}
@@ -644,51 +693,32 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		currentIndex := 0
 		groupNum := 1
 
-		for currentIndex < totalRaw {
+		var nextBatchChan <-chan prefetchResult
+		if currentIndex < totalRaw {
 			endIndex := currentIndex + groupSize
 			if endIndex > totalRaw {
 				endIndex = totalRaw
 			}
 			candidateRawFiles := rawFiles[currentIndex:endIndex]
 			currentIndex = endIndex
+			nextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+		}
 
-			// 预处理这 10 个候选文件
-			var processedFiles []uploadFile
-			for _, raw := range candidateRawFiles {
-				// 慢速处理以太密集 API 限制，每文件间隔 100ms
-				time.Sleep(100 * time.Millisecond)
+		for nextBatchChan != nil {
+			res := <-nextBatchChan
+			processedFiles := res.processedFiles
 
-				info, err := os.Stat(raw.path)
-				if err != nil {
-					fmt.Printf("  ⚠️  文件不可达 (%s): %v，跳过\n", raw.name, err)
-					continue
+			var currentNextBatchChan <-chan prefetchResult
+			if currentIndex < totalRaw {
+				endIndex := currentIndex + groupSize
+				if endIndex > totalRaw {
+					endIndex = totalRaw
 				}
-
-				meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp)
-				if err != nil {
-					fmt.Printf("  ⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", raw.name, err)
-					continue
-				}
-
-				if meta.FileType == "other" {
-					fmt.Printf("  ℹ️  非媒体格式文件且不支持转码，自动跳过: %s\n", raw.name)
-					continue
-				}
-
-				if !forceUp && meta.UploadStatus == "success" {
-					fmt.Printf("  ℹ️  文件已上传成功，自动跳过: %s\n", raw.name)
-					continue
-				}
-
-				processedFiles = append(processedFiles, uploadFile{
-					path:        meta.FilePath,
-					name:        raw.name,
-					size:        meta.FileSize,
-					modTime:     meta.ModTime,
-					createdTime: meta.CreatedTime,
-					metadata:    meta,
-				})
+				candidateRawFiles := rawFiles[currentIndex:endIndex]
+				currentIndex = endIndex
+				currentNextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
 			}
+			nextBatchChan = currentNextBatchChan
 
 			if len(processedFiles) == 0 {
 				continue
@@ -935,7 +965,7 @@ func updateCacheStatus(cacheDir string, sha1Val string, status string) {
 	}
 }
 
-func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh bool, transcode bool, forceUp bool) (MediaMetadata, error) {
+func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int) (MediaMetadata, error) {
 	createdTime := getBirthTime(info)
 	sha1Val := calculateSHA1(info.Name(), createdTime, info.ModTime(), info.Size())
 	jsonPath := filepath.Join(cacheDir, sha1Val+".json")
@@ -1174,8 +1204,9 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 			meta.GeoInfo = geo
 		}
 
-		// C. ffmpeg 导出图片缩略图 (限制 320x320 JPEG，且仅在图片体积超过 2MB 时生成)
-		if meta.FileSize > 2*1024*1024 {
+		// C. ffmpeg 导出图片缩略图 (限制 320x320 JPEG，且仅在图片体积超过指定 MB 时生成)
+		thumbSizeLimit := int64(thumbMinSizeMB) * 1024 * 1024
+		if meta.FileSize > thumbSizeLimit {
 			fmt.Printf("🎨 正在为图片生成缩略图: %s (%s)...\n", filepath.Base(filePath), formatSize(meta.FileSize))
 			thumbPath := filepath.Join(cacheDir, sha1Val+"_thumb.jpg")
 			cmdThumb := exec.Command("ffmpeg", "-y", "-i", filePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-q:v", "5", thumbPath)

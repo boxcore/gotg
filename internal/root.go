@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ var (
 	forceUp      bool
 	transcode    bool
 	useRRotation bool
+	thumbMinSizeMB int
 )
 
 // 💡 升级后的通用参数检查器：支持直接检查切片([]string)或普通字符串(string)
@@ -73,7 +75,7 @@ func parseTokens() []string {
 var RootCmd = &cobra.Command{
 	Use:     "gotg",
 	Short:   "gotg 是一个 Telegram Bot 运维及媒体辅助工具",
-	Version: "v0.1.3",
+	Version: "v0.1.4",
 	Run: func(cmd *cobra.Command, args []string) {
 		// 💡 如果命令行没有传递 Flag，则从环境变量中 Fallback
 		if tokenStr == "" {
@@ -84,6 +86,14 @@ var RootCmd = &cobra.Command{
 		}
 		if apiURL == "" {
 			apiURL = os.Getenv("API_URL")
+		}
+
+		if !cmd.Flags().Changed("thumb-min-size") {
+			if envThumb := os.Getenv("THUMB_MIN_SIZE"); envThumb != "" {
+				if val, err := strconv.Atoi(envThumb); err == nil {
+					thumbMinSizeMB = val
+				}
+			}
 		}
 
 		// 💡 优先解析出 activeTokens，方便后续 case 直接复用校验
@@ -155,7 +165,7 @@ var RootCmd = &cobra.Command{
 				}
 
 				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
-				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 调试输出失败: %v\n", err)
 				}
 				return
@@ -199,14 +209,14 @@ var RootCmd = &cobra.Command{
 				}
 
 				fmt.Printf("📂 开始多 Bot 轮询上传 (共 %d 个 Bot)...\n", len(activeTokens))
-				if err := UploadDirectoryFiles(activeTokens, true, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+				if err := UploadDirectoryFiles(activeTokens, true, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 轮询上传中断: %v\n", err)
 				}
 			} else {
 				fmt.Printf("📂 开始多 Bot 独立完全上传 (共 %d 个 Bot)...\n", len(activeTokens))
 				for i, t := range activeTokens {
 					fmt.Printf("\n[Bot %d/%d 正在分发任务] (Token: %s, ChatID: %s) -----------------------\n", i+1, len(activeTokens), maskToken(t), chatID)
-					if err := UploadDirectoryFiles([]string{t}, false, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode); err != nil {
+					if err := UploadDirectoryFiles([]string{t}, false, chatID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 						fmt.Printf("❌ 该 Bot 上传中止: %v\n", err)
 					}
 				}
@@ -255,6 +265,7 @@ func init() {
 	RootCmd.Flags().BoolVar(&forceUp, "force-up", false, "强制重新上传已成功上传的文件")
 	RootCmd.Flags().BoolVar(&transcode, "transcode", false, "强制转码不合规的视频文件而不需要确认")
 	RootCmd.Flags().BoolVarP(&useRRotation, "r-rotation", "r", false, "轮询使用多个 Token 上传各个媒体组")
+	RootCmd.Flags().IntVar(&thumbMinSizeMB, "thumb-min-size", 2, "图片生成缩略图的最小体积阈值限制，默认是2（MB）")
 
 	// 💡 加载本地 .env 配置文件
 	loadEnv()
