@@ -290,6 +290,7 @@ func isThumbnailBlack(path string) bool {
 
 type prefetchResult struct {
 	processedFiles []uploadFile
+	err            error
 }
 
 func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int) <-chan prefetchResult {
@@ -302,12 +303,22 @@ func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool
 
 			info, err := os.Stat(raw.path)
 			if err != nil {
+				if isWebDAVIOError(err) {
+					ch <- prefetchResult{err: err}
+					close(ch)
+					return
+				}
 				fmt.Printf("  ⚠️  文件不可达 (%s): %v，跳过\n", raw.name, err)
 				continue
 			}
 
 			meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
 			if err != nil {
+				if isWebDAVIOError(err) {
+					ch <- prefetchResult{err: err}
+					close(ch)
+					return
+				}
 				fmt.Printf("  ⚠️  媒体预处理失败 (%s): %v，将跳过此不支持的文件\n", raw.name, err)
 				continue
 			}
@@ -385,6 +396,9 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
+		if isWebDAVIOError(err) {
+			sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+		}
 		return fmt.Errorf("路径不存在或无法访问: %w", err)
 	}
 
@@ -450,6 +464,9 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		// 1. 扫描 cleanPath 下直属的二级子目录
 		entries, err := os.ReadDir(cleanPath)
 		if err != nil {
+			if isWebDAVIOError(err) {
+				sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+			}
 			return fmt.Errorf("读取目录失败: %w", err)
 		}
 
@@ -483,6 +500,9 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			}
 			tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, rootTitleBase)
 			if err != nil {
+				if isWebDAVIOError(err) {
+					sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+				}
 				return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
 			}
 			allDirTasks = append(allDirTasks, tasksForThisDir...)
@@ -537,6 +557,9 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 				tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
 				if err != nil {
+					if isWebDAVIOError(err) {
+						sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+					}
 					return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
 				}
 				allDirTasks = append(allDirTasks, tasksForThisDir...)
@@ -850,6 +873,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		
 		rawFiles, err := processSingleDir(task.Path, cacheDir, forceUp, sortType)
 		if err != nil {
+			if isWebDAVIOError(err) {
+				sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+				return fmt.Errorf("读取目录失败 (WebDAV/IO 错误): %w", err)
+			}
 			fmt.Printf("❌ 读取目录 %s 失败: %v\n", task.Path, err)
 			continue
 		}
@@ -878,6 +905,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 
 		for nextBatchChan != nil {
 			res := <-nextBatchChan
+			if res.err != nil && isWebDAVIOError(res.err) {
+				sendAlertNotification(tokens, apiURL, notifyID, res.err.Error(), targetPath)
+				return fmt.Errorf("预处理文件失败 (WebDAV/IO 错误): %w", res.err)
+			}
 			processedFiles := res.processedFiles
 
 			var currentNextBatchChan <-chan prefetchResult
@@ -1026,6 +1057,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					for _, fh := range openFiles {
 						_ = fh.Close()
 					}
+					if isWebDAVIOError(openErr) {
+						sendAlertNotification(tokens, apiURL, notifyID, openErr.Error(), targetPath)
+						return fmt.Errorf("读取文件失败 (WebDAV/IO 错误): %w", openErr)
+					}
 					fmt.Println("❌ 上传组失败: 无法打开部分文件")
 					totalGroupsCount++
 					failedGroupsCount++
@@ -1057,6 +1092,10 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				}
 
 				if err != nil {
+					if isWebDAVIOError(err) {
+						sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+						return fmt.Errorf("上传媒体组失败 (WebDAV/IO 错误): %w", err)
+					}
 					fmt.Printf("❌ 媒体组上传失败: %v\n", err)
 					for _, f := range batch {
 						updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
@@ -1926,4 +1965,64 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	return fmt.Sprintf("%ds", s)
+}
+
+func isWebDAVIOError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "timed out") ||
+		strings.Contains(errStr, "operation not supported") ||
+		strings.Contains(errStr, "input/output error") ||
+		strings.Contains(errStr, "transport endpoint is not connected") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "i/o error")
+}
+
+func sendAlertNotification(tokens []string, apiURL string, notifyID string, errMsg string, targetPath string) {
+	if len(tokens) == 0 || notifyID == "" {
+		return
+	}
+	var opts []telego.BotOption
+	opts = append(opts, telego.WithDefaultLogger(false, false))
+	if apiURL != "" {
+		opts = append(opts, telego.WithAPIServer(apiURL))
+	}
+	bot, err := telego.NewBot(tokens[0], opts...)
+	if err != nil {
+		fmt.Printf("⚠️ 报警 Bot 初始化失败: %v\n", err)
+		return
+	}
+
+	hostname, hostnameErr := os.Hostname()
+	if hostnameErr != nil {
+		hostname = "unknown-host"
+	}
+
+	loc := time.FixedZone("CST", 8*3600) // 东八区
+	timeStr := time.Now().In(loc).Format("2006-01-02 15:04:05")
+
+	var sb strings.Builder
+	sb.WriteString("🚨 <b>gotg 任务因 WebDAV / IO 异常异常中止</b>\n\n")
+	sb.WriteString(fmt.Sprintf("💻 <b>执行服务器</b>：<code>%s</code>\n", escapeHTML(hostname)))
+	sb.WriteString(fmt.Sprintf("📂 <b>目标路径</b>：<code>%s</code>\n", escapeHTML(targetPath)))
+	sb.WriteString(fmt.Sprintf("📅 <b>发生时间</b>：<code>%s (UTC+8)</code>\n", timeStr))
+	sb.WriteString(fmt.Sprintf("❌ <b>错误信息</b>：<code>%s</code>\n", escapeHTML(errMsg)))
+
+	targetChatID := parseChatID(notifyID)
+	fmt.Printf("\n🔄 正在向通知接收人 (%s) 发送 WebDAV/IO 异常报警...\n", notifyID)
+	_, sendErr := bot.SendMessage(context.Background(), &telego.SendMessageParams{
+		ChatID:    targetChatID,
+		Text:      sb.String(),
+		ParseMode: telego.ModeHTML,
+	})
+	if sendErr != nil {
+		fmt.Printf("⚠️ 报警发送失败: %v\n", sendErr)
+	} else {
+		fmt.Println("✅ 异常中止报警已成功发送至您的 Telegram！")
+	}
 }
