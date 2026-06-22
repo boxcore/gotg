@@ -35,6 +35,8 @@ type MediaMetadata struct {
 	FileType     string    `json:"file_type"` // "video", "image", "other"
 	UploadStatus string    `json:"upload_status,omitempty"`
 	UploadTime   time.Time `json:"upload_time,omitempty"`
+	MediaGroupID string    `json:"media_group_id,omitempty"`
+	FileID       string    `json:"file_id,omitempty"`
 
 	// 视频特有
 	Duration     float64 `json:"duration,omitempty"` // 秒
@@ -1078,11 +1080,13 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				}
 
 				totalGroupsCount++
-				_, err = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
+				var messages []telego.Message
+				messages, err = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
 					ChatID: chatID,
 					Media:  mediaList,
 				})
 
+				// 无论是成功还是发生普通错误，先关闭本轮文件句柄
 				for _, fh := range openFiles {
 					_ = fh.Close()
 				}
@@ -1092,11 +1096,126 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				}
 
 				if err != nil {
+					// 1. 如果是 WebDAV / IO 超时或系统错误，立即报警并退出任务
 					if isWebDAVIOError(err) {
 						sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
 						return fmt.Errorf("上传媒体组失败 (WebDAV/IO 错误): %w", err)
 					}
-					fmt.Printf("❌ 媒体组上传失败: %v\n", err)
+
+					// 2. 如果是正常的 TG API 报错，等待 35 秒后发起重试
+					fmt.Printf("⚠️ 媒体组上传失败: %v。将在 35 秒后重新尝试上传...\n", err)
+					time.Sleep(35 * time.Second)
+
+					var retryOpenFiles []*os.File
+					var retryMediaList []telego.InputMedia
+					var retryOpenErr error
+
+					for mediaIdx, f := range batch {
+						uploadPath := f.path
+						if f.metadata.TranPath != "" {
+							uploadPath = f.metadata.TranPath
+						}
+
+						caption := ""
+						if mediaIdx == 0 {
+							caption = batchTitle
+						}
+
+						fileHandle, err := os.Open(uploadPath)
+						if err != nil {
+							retryOpenErr = err
+							break
+						}
+						retryOpenFiles = append(retryOpenFiles, fileHandle)
+
+						var reader telegoapi.NamedReader = fileHandle
+						if debugMode == "" {
+							reader = &ProgressNamedReader{
+								Reader: fileHandle,
+								name:   filepath.Base(uploadPath),
+								onRead: func(n int) {
+									// 不需要在此处输出新进度条，保持安静即可
+								},
+							}
+						}
+
+						if f.metadata.FileType == "video" {
+							doc := &telego.InputMediaVideo{
+								Type:              "video",
+								Media:             telego.InputFile{File: reader},
+								Width:             f.metadata.Width,
+								Height:            f.metadata.Height,
+								Duration:          int(f.metadata.Duration),
+								SupportsStreaming: true,
+								Caption:           caption,
+							}
+							if f.metadata.ThumbPath != "" {
+								thumbHandle, err := os.Open(f.metadata.ThumbPath)
+								if err == nil {
+									retryOpenFiles = append(retryOpenFiles, thumbHandle)
+									doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+								}
+							}
+							retryMediaList = append(retryMediaList, doc)
+						} else if f.metadata.FileType == "image" {
+							doc := &telego.InputMediaPhoto{
+								Type:    "photo",
+								Media:   telego.InputFile{File: reader},
+								Caption: caption,
+							}
+							retryMediaList = append(retryMediaList, doc)
+						} else {
+							doc := &telego.InputMediaDocument{
+								Type:    "document",
+								Media:   telego.InputFile{File: reader},
+								Caption: caption,
+							}
+							if f.metadata.ThumbPath != "" {
+								thumbHandle, err := os.Open(f.metadata.ThumbPath)
+								if err == nil {
+									retryOpenFiles = append(retryOpenFiles, thumbHandle)
+									doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+								}
+							}
+							retryMediaList = append(retryMediaList, doc)
+						}
+					}
+
+					if retryOpenErr != nil {
+						for _, fh := range retryOpenFiles {
+							_ = fh.Close()
+						}
+						if isWebDAVIOError(retryOpenErr) {
+							sendAlertNotification(tokens, apiURL, notifyID, retryOpenErr.Error(), targetPath)
+							return fmt.Errorf("读取文件失败 (WebDAV/IO 错误): %w", retryOpenErr)
+						}
+						err = fmt.Errorf("重试时无法打开部分文件: %w", retryOpenErr)
+					} else {
+						fmt.Println("🔄 正在重新发起上传...")
+						var retryErr error
+						var messagesResult []telego.Message
+						messagesResult, retryErr = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
+							ChatID: chatID,
+							Media:  retryMediaList,
+						})
+
+						for _, fh := range retryOpenFiles {
+							_ = fh.Close()
+						}
+
+						if retryErr != nil && isWebDAVIOError(retryErr) {
+							sendAlertNotification(tokens, apiURL, notifyID, retryErr.Error(), targetPath)
+							return fmt.Errorf("上传媒体组失败 (WebDAV/IO 错误): %w", retryErr)
+						}
+						err = retryErr
+						if err == nil {
+							messages = messagesResult
+						}
+					}
+				}
+
+				if err != nil {
+					fmt.Printf("❌ 媒体组重试上传依然失败: %v\n", err)
 					for _, f := range batch {
 						updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
 					}
@@ -1114,8 +1233,14 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				} else {
 					fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
 					count += len(batch)
-					for _, f := range batch {
-						updateCacheStatus(cacheDir, f.metadata.SHA1, "success")
+					for i, f := range batch {
+						mediaGroupID := ""
+						fileID := ""
+						if i < len(messages) {
+							mediaGroupID = messages[i].MediaGroupID
+							fileID = getFileIDFromMessage(messages[i])
+						}
+						updateCacheSuccess(cacheDir, f.metadata.SHA1, mediaGroupID, fileID)
 						cleanTranscodeFiles(cacheDir, f.metadata)
 					}
 					successGroupsCount++
@@ -1972,6 +2097,10 @@ func isWebDAVIOError(err error) bool {
 		return false
 	}
 	errStr := strings.ToLower(err.Error())
+	// 如果是 Telegram API 明确返回的错误，排除在 WebDAV IO 错误之外
+	if strings.Contains(errStr, "api:") || strings.Contains(errStr, "bad request") || strings.Contains(errStr, "too many requests") {
+		return false
+	}
 	return strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "timed out") ||
 		strings.Contains(errStr, "operation not supported") ||
@@ -1980,7 +2109,8 @@ func isWebDAVIOError(err error) bool {
 		strings.Contains(errStr, "connection refused") ||
 		strings.Contains(errStr, "connection reset") ||
 		strings.Contains(errStr, "broken pipe") ||
-		strings.Contains(errStr, "i/o error")
+		strings.Contains(errStr, "i/o error") ||
+		strings.Contains(errStr, "state not recoverable")
 }
 
 func sendAlertNotification(tokens []string, apiURL string, notifyID string, errMsg string, targetPath string) {
@@ -2024,5 +2154,42 @@ func sendAlertNotification(tokens []string, apiURL string, notifyID string, errM
 		fmt.Printf("⚠️ 报警发送失败: %v\n", sendErr)
 	} else {
 		fmt.Println("✅ 异常中止报警已成功发送至您的 Telegram！")
+	}
+}
+
+func getFileIDFromMessage(msg telego.Message) string {
+	if msg.Video != nil {
+		return msg.Video.FileID
+	}
+	if len(msg.Photo) > 0 {
+		return msg.Photo[len(msg.Photo)-1].FileID
+	}
+	if msg.Document != nil {
+		return msg.Document.FileID
+	}
+	if msg.Audio != nil {
+		return msg.Audio.FileID
+	}
+	return ""
+}
+
+func updateCacheSuccess(cacheDir string, sha1Val string, mediaGroupID string, fileID string) {
+	jsonPath := filepath.Join(cacheDir, sha1Val+".json")
+	cachedData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return
+	}
+	var meta MediaMetadata
+	if err := json.Unmarshal(cachedData, &meta); err != nil {
+		return
+	}
+	meta.UploadStatus = "success"
+	meta.UploadTime = time.Now()
+	meta.MediaGroupID = mediaGroupID
+	meta.FileID = fileID
+
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(jsonPath, metaJSON, 0644)
 	}
 }
