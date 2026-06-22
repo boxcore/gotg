@@ -1106,6 +1106,8 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					fmt.Printf("⚠️ 媒体组上传失败: %v。将在 35 秒后重新尝试上传...\n", err)
 					time.Sleep(35 * time.Second)
 
+					uploadedBytes = 0 // 重置进度，以支持重试时绘制进度条
+
 					var retryOpenFiles []*os.File
 					var retryMediaList []telego.InputMedia
 					var retryOpenErr error
@@ -1134,7 +1136,11 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 								Reader: fileHandle,
 								name:   filepath.Base(uploadPath),
 								onRead: func(n int) {
-									// 不需要在此处输出新进度条，保持安静即可
+									mu.Lock()
+									uploadedBytes += int64(n)
+									currentFile = f.name
+									drawProgressBar(uploadedBytes, totalBytes, currentFile)
+									mu.Unlock()
 								},
 							}
 						}
