@@ -146,6 +146,37 @@ func scanAndCollectDirPaths(targetPath string, baseTitle string) ([]DirTask, err
 }
 
 func processSingleDir(dirPath string, cacheDir string, forceUp bool, sortType string) ([]rawFile, error) {
+	fileInfo, err := os.Stat(dirPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if !fileInfo.IsDir() {
+		// 单文件支持
+		if !isMediaFile(fileInfo.Name()) {
+			return nil, fmt.Errorf("指定的路径不是支持的媒体格式文件: %s", fileInfo.Name())
+		}
+
+		createdTime := getBirthTime(fileInfo)
+		sha1Val := calculateSHA1(fileInfo.Name(), createdTime, fileInfo.ModTime(), fileInfo.Size())
+
+		if !forceUp {
+			if isSuccessInCache(cacheDir, sha1Val) {
+				return nil, nil // 已经上传成功过
+			}
+		}
+
+		return []rawFile{
+			{
+				path:        dirPath,
+				name:        fileInfo.Name(),
+				size:        fileInfo.Size(),
+				modTime:     fileInfo.ModTime(),
+				createdTime: createdTime,
+			},
+		}, nil
+	}
+
 	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return nil, err
@@ -308,69 +339,18 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 		return fmt.Errorf("路径不存在或无法访问: %w", err)
 	}
 
-	if !fileInfo.IsDir() {
-		return fmt.Errorf("指定的路径 '%s' 不是一个目录", targetPath)
-	}
-
-	// 1. 扫描 cleanPath 下直属的二级子目录
-	entries, err := os.ReadDir(cleanPath)
-	if err != nil {
-		return fmt.Errorf("读取目录失败: %w", err)
-	}
-
-	var secondLevelDirs []os.DirEntry
-	for _, entry := range entries {
-		if entry.IsDir() {
-			secondLevelDirs = append(secondLevelDirs, entry)
-		}
-	}
-
 	var allDirTasks []DirTask
 
-	if len(secondLevelDirs) == 0 {
-		baseTitle := filepath.Base(cleanPath)
+	if !fileInfo.IsDir() {
+		// 单文件支持
+		baseTitle := strings.TrimSuffix(filepath.Base(cleanPath), filepath.Ext(cleanPath))
 		if uploadTitle != "" {
 			baseTitle = uploadTitle
-		} else if debugMode == "" || debugMode == "list" || debugMode == "curl" {
-			fmt.Printf("❓ 目标目录 '%s' 下没有二级子目录。是否使用该目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ", baseTitle)
-			reader := bufio.NewReader(os.Stdin)
-			input, _ := reader.ReadString('\n')
-			input = strings.TrimSpace(strings.ToLower(input))
-
-			if input == "n" || input == "no" {
-				fmt.Print("📝 请输入自定义标题: ")
-				customTitle, _ := reader.ReadString('\n')
-				customTitle = strings.TrimSpace(customTitle)
-				if customTitle != "" {
-					baseTitle = customTitle
-				}
-			}
-		}
-
-		tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, baseTitle)
-		if err != nil {
-			return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
-		}
-		allDirTasks = append(allDirTasks, tasksForThisDir...)
-	} else {
-		// 2. 询问用户标题逻辑
-		var secondLevelBaseTitles []string
-		if debugMode == "" || debugMode == "list" || debugMode == "curl" {
-			if uploadTitle != "" {
-				// 如果命令行显式传入了 --title
-				if len(secondLevelDirs) == 1 {
-					secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-				} else {
-					for idx := range secondLevelDirs {
-						if idx == 0 {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-						} else {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
-						}
-					}
-				}
-			} else {
-				fmt.Print("❓ 是否使用二级目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ")
+		} else {
+			// 如果没有传 --title 参数
+			// 仅当没有启用 -r 参数，且为单个文件时，进行提示询问
+			if !useRRotation && (debugMode == "" || debugMode == "list" || debugMode == "curl") {
+				fmt.Printf("❓ 是否使用文件名作为标题？[Y/n] (输入 n 可自定义输入标题): ")
 				reader := bufio.NewReader(os.Stdin)
 				input, _ := reader.ReadString('\n')
 				input = strings.TrimSpace(strings.ToLower(input))
@@ -379,21 +359,119 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					fmt.Print("📝 请输入自定义标题: ")
 					customTitle, _ := reader.ReadString('\n')
 					customTitle = strings.TrimSpace(customTitle)
-					if customTitle == "" {
-						fmt.Println("⚠️  输入为空，自动回退使用各二级目录名称。")
+					if customTitle != "" {
+						baseTitle = customTitle
+					}
+				}
+			}
+		}
+
+		allDirTasks = []DirTask{
+			{
+				Path:      cleanPath,
+				TitleBase: baseTitle,
+			},
+		}
+	} else {
+		// 1. 扫描 cleanPath 下直属的二级子目录
+		entries, err := os.ReadDir(cleanPath)
+		if err != nil {
+			return fmt.Errorf("读取目录失败: %w", err)
+		}
+
+		var secondLevelDirs []os.DirEntry
+		for _, entry := range entries {
+			if entry.IsDir() {
+				secondLevelDirs = append(secondLevelDirs, entry)
+			}
+		}
+
+		if len(secondLevelDirs) == 0 {
+			baseTitle := filepath.Base(cleanPath)
+			if uploadTitle != "" {
+				baseTitle = uploadTitle
+			} else if debugMode == "" || debugMode == "list" || debugMode == "curl" {
+				fmt.Printf("❓ 目标目录 '%s' 下没有二级子目录。是否使用该目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ", baseTitle)
+				reader := bufio.NewReader(os.Stdin)
+				input, _ := reader.ReadString('\n')
+				input = strings.TrimSpace(strings.ToLower(input))
+
+				if input == "n" || input == "no" {
+					fmt.Print("📝 请输入自定义标题: ")
+					customTitle, _ := reader.ReadString('\n')
+					customTitle = strings.TrimSpace(customTitle)
+					if customTitle != "" {
+						baseTitle = customTitle
+					}
+				}
+			}
+
+			tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, baseTitle)
+			if err != nil {
+				return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
+			}
+			allDirTasks = append(allDirTasks, tasksForThisDir...)
+		} else {
+			// 2. 询问用户标题逻辑
+			var secondLevelBaseTitles []string
+			if debugMode == "" || debugMode == "list" || debugMode == "curl" {
+				if uploadTitle != "" {
+					// 如果命令行显式传入了 --title
+					if len(secondLevelDirs) == 1 {
+						secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
+					} else {
+						for idx := range secondLevelDirs {
+							if idx == 0 {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
+							} else {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
+							}
+						}
+					}
+				} else {
+					fmt.Print("❓ 是否使用二级目录名称作为标题？[Y/n] (输入 n 可自定义输入标题): ")
+					reader := bufio.NewReader(os.Stdin)
+					input, _ := reader.ReadString('\n')
+					input = strings.TrimSpace(strings.ToLower(input))
+
+					if input == "n" || input == "no" {
+						fmt.Print("📝 请输入自定义标题: ")
+						customTitle, _ := reader.ReadString('\n')
+						customTitle = strings.TrimSpace(customTitle)
+						if customTitle == "" {
+							fmt.Println("⚠️  输入为空，自动回退使用各二级目录名称。")
+							for _, d := range secondLevelDirs {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
+							}
+						} else {
+							if len(secondLevelDirs) == 1 {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
+							} else {
+								for idx := range secondLevelDirs {
+									if idx == 0 {
+										secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
+									} else {
+										secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", customTitle, idx+1))
+									}
+								}
+							}
+						}
+					} else {
 						for _, d := range secondLevelDirs {
 							secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
 						}
+					}
+				}
+			} else {
+				if uploadTitle != "" {
+					if len(secondLevelDirs) == 1 {
+						secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
 					} else {
-						if len(secondLevelDirs) == 1 {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
-						} else {
-							for idx := range secondLevelDirs {
-								if idx == 0 {
-									secondLevelBaseTitles = append(secondLevelBaseTitles, customTitle)
-								} else {
-									secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", customTitle, idx+1))
-								}
+						for idx := range secondLevelDirs {
+							if idx == 0 {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
+							} else {
+								secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
 							}
 						}
 					}
@@ -403,36 +481,18 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					}
 				}
 			}
-		} else {
-			if uploadTitle != "" {
-				if len(secondLevelDirs) == 1 {
-					secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-				} else {
-					for idx := range secondLevelDirs {
-						if idx == 0 {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, uploadTitle)
-						} else {
-							secondLevelBaseTitles = append(secondLevelBaseTitles, fmt.Sprintf("%s_%d", uploadTitle, idx+1))
-						}
-					}
-				}
-			} else {
-				for _, d := range secondLevelDirs {
-					secondLevelBaseTitles = append(secondLevelBaseTitles, d.Name())
-				}
-			}
-		}
 
-		// 3. 极速探测各二级目录及子目录下的结构树，仅扫描路径不读取文件大属性
-		for idx, d := range secondLevelDirs {
-			subDirPath := filepath.Join(cleanPath, d.Name())
-			baseTitleForThisDir := secondLevelBaseTitles[idx]
+			// 3. 极速探测各二级目录及子目录下的结构树，仅扫描路径不读取文件大属性
+			for idx, d := range secondLevelDirs {
+				subDirPath := filepath.Join(cleanPath, d.Name())
+				baseTitleForThisDir := secondLevelBaseTitles[idx]
 
-			tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
-			if err != nil {
-				return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
+				tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
+				if err != nil {
+					return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
+				}
+				allDirTasks = append(allDirTasks, tasksForThisDir...)
 			}
-			allDirTasks = append(allDirTasks, tasksForThisDir...)
 		}
 	}
 
