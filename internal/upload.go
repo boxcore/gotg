@@ -218,6 +218,39 @@ func processSingleDir(dirPath string, cacheDir string, forceUp bool, sortType st
 	return files, nil
 }
 
+func isThumbnailBlack(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return true
+	}
+
+	bounds := img.Bounds()
+	totalPixels := bounds.Dx() * bounds.Dy()
+	if totalPixels == 0 {
+		return true
+	}
+
+	var totalLuminance float64
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, _ := img.At(x, y).RGBA()
+			rf := float64(r >> 8)
+			gf := float64(g >> 8)
+			bf := float64(b >> 8)
+			totalLuminance += 0.299*rf + 0.587*gf + 0.114*bf
+		}
+	}
+
+	avgLuminance := totalLuminance / float64(totalPixels)
+	return avgLuminance < 10.0
+}
+
 type prefetchResult struct {
 	processedFiles []uploadFile
 }
@@ -1221,11 +1254,25 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 		if meta.FileType == "video" {
 			fmt.Printf("🎬 正在为视频生成缩略图: %s...\n", filepath.Base(meta.FilePath))
 			thumbPath := filepath.Join(cacheDir, sha1Val+"_thumb.jpg")
+			
+			// A. 默认在首帧（00:00:00）截图
 			cmdThumb := exec.Command("ffmpeg", "-y", "-ss", "00:00:00", "-i", meta.FilePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-vframes", "1", "-q:v", "5", thumbPath)
 			if err := cmdThumb.Run(); err == nil {
-				meta.ThumbPath = thumbPath
+				// B. 检测截图是否为纯黑屏。如果是，且时长足够，则退回到第 1 秒截图
+				if isThumbnailBlack(thumbPath) && meta.Duration > 1.0 {
+					fmt.Printf("ℹ️  视频首帧截图为纯黑，正在尝试在第 1 秒处重新生成缩略图: %s...\n", filepath.Base(meta.FilePath))
+					cmdThumb1s := exec.Command("ffmpeg", "-y", "-ss", "00:00:01", "-i", meta.FilePath, "-vf", "scale='if(gt(iw,ih),320,-1)':'if(gt(iw,ih),-1,320)'", "-vframes", "1", "-q:v", "5", thumbPath)
+					if err1s := cmdThumb1s.Run(); err1s == nil {
+						meta.ThumbPath = thumbPath
+					} else {
+						fmt.Printf("⚠️  视频第 1 秒缩略图重新生成失败: %v\n", err1s)
+						meta.ThumbPath = thumbPath // 依然保留首帧图作为底限
+					}
+				} else {
+					meta.ThumbPath = thumbPath
+				}
 			} else {
-				fmt.Printf("⚠️  视频缩略图生成失败: %v\n", err)
+				fmt.Printf("⚠️  视频首帧缩略图生成失败: %v\n", err)
 			}
 		}
 
