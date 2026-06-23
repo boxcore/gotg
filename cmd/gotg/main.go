@@ -1,6 +1,6 @@
 package main
 
-import "github.com/boxcore/gotg/internal"
+import "github.com/cnnas/gotg/internal"
 
 func main() {
 	// 调用 internal/root.go 中的启动函数

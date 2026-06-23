@@ -11,7 +11,7 @@
 直接在终端运行以下一键命令，程序将自动识别您的操作系统 (Linux/macOS) 及架构，下载最新的 `gotg` 发布包并安装至系统的 `/usr/local/bin` 目录：
 
 ```bash
-curl -s https://api.github.com/repos/boxcore/gotg/releases/latest \
+curl -s https://api.github.com/repos/cnnas/gotg/releases/latest \
 | grep "browser_download_url.*$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')" \
 | cut -d : -f 2,3 | tr -d \" | xargs curl -L -o gotg.tar.gz \
 && tar -xzf gotg.tar.gz \
