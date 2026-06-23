@@ -14,8 +14,8 @@ import (
 )
 
 var (
-	Version   = "v0.1.6"
-	BuildTime = "2026-06-23 00:55:00"
+	Version   = "v0.1.7"
+	BuildTime = "2026-06-23 14:15:00"
 	Author    = "boxcore"
 )
 

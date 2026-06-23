@@ -2369,9 +2369,95 @@ func downloadToCache(batch []uploadFile, cacheDir string, limit int64) error {
 			return fmt.Errorf("下载 WebDAV 源文件失败: %w", err)
 		}
 
+		// 💡 优化：检测 MP4/MOV 文件播放索引 (moov) 所在位置，若在尾部则使用 FFmpeg 无损流拷贝移至头部以支持在线即时预览
+		ext := strings.ToLower(filepath.Ext(f.name))
+		if ext == ".mp4" || ext == ".mov" {
+			atEnd, err := isMoovAtEnd(targetOrgPath)
+			if err == nil && atEnd {
+				fmt.Printf("⚡ [性能优化] 检测到视频 '%s' 播放索引 (moov) 处于尾部，正在使用 FFmpeg 优化（faststart）以支持即时播放...\n", f.name)
+				fastPath := filepath.Join(cacheDir, f.metadata.SHA1+"_fast"+ext)
+				cmdFast := exec.Command("ffmpeg", "-y", "-i", targetOrgPath, "-c", "copy", "-movflags", "+faststart", fastPath)
+				if errFast := cmdFast.Run(); errFast == nil {
+					_ = os.Remove(targetOrgPath)
+					if errRename := os.Rename(fastPath, targetOrgPath); errRename == nil {
+						fmt.Println("✅ 视频播放索引已无损成功移至文件头部！")
+					} else {
+						_ = os.Remove(fastPath)
+					}
+				} else {
+					_ = os.Remove(fastPath)
+					fmt.Printf("⚠️ 视频播放索引优化失败: %v\n", errFast)
+				}
+			}
+		}
+
 		// 6. 更新 json 缓存中的 org_path 字段
 		updateCacheOrgPath(cacheDir, f.metadata.SHA1, targetOrgPath)
 		f.path = targetOrgPath
 	}
 	return nil
+}
+
+func isMoovAtEnd(filePath string) (bool, error) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext != ".mp4" && ext != ".mov" {
+		return false, nil
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	var header [8]byte
+	var offset int64 = 0
+
+	for {
+		_, err := file.ReadAt(header[:], offset)
+		if err != nil {
+			// 读取到文件尾部或无法正常读取，判定为没有在头部找到 moov
+			return false, nil
+		}
+
+		boxSize := int64(uint32(header[0])<<24 | uint32(header[1])<<16 | uint32(header[2])<<8 | uint32(header[3]))
+		boxType := string(header[4:8])
+
+		if boxSize == 1 {
+			var largeSizeBuf [8]byte
+			_, err = file.ReadAt(largeSizeBuf[:], offset+8)
+			if err != nil {
+				return false, nil
+			}
+			boxSize = int64(uint64(largeSizeBuf[0])<<56 | uint64(largeSizeBuf[1])<<48 | uint64(largeSizeBuf[2])<<40 | uint64(largeSizeBuf[3])<<32 |
+				uint64(largeSizeBuf[4])<<24 | uint64(largeSizeBuf[5])<<16 | uint64(largeSizeBuf[6])<<8 | uint64(largeSizeBuf[7]))
+			offset += 16
+		} else if boxSize == 0 {
+			boxSize = 0
+		} else {
+			offset += 8
+		}
+
+		if boxType == "moov" {
+			// moov 在 mdat 之前，说明已经优化过了
+			return false, nil
+		}
+
+		if boxType == "mdat" {
+			// mdat 在 moov 之前，说明 moov 必定在后面（尾部）
+			return true, nil
+		}
+
+		if boxSize == 0 {
+			return false, nil
+		}
+		if boxSize < 8 {
+			return false, nil // 防止死循环
+		}
+
+		offset = offset - 8 + boxSize
+		if offset > 10*1024*1024 { // 最多向后探测 10MB，保护大文件解析性能
+			return false, nil
+		}
+	}
 }

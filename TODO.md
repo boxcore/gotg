@@ -8,6 +8,11 @@
 
     ```bash
     ffmpeg -i 苹果需要下载完成才能预览1.mp4 -c copy -movflags +faststart 优化后的视频.mp4
+    # 参数解释：
+    -c copy：音视频完全复制，不重新编码，瞬间完成且无损。
+    -movflags +faststart：核心参数。告诉 FFmpeg 在封装完成后面，把 moov atom 移动到文件的最开头。
     ```
+    
+
 
 
