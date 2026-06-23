@@ -296,7 +296,7 @@ type prefetchResult struct {
 	err            error
 }
 
-func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int) <-chan prefetchResult {
+func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int, debugMode string) <-chan prefetchResult {
 	ch := make(chan prefetchResult, 1)
 	go func() {
 		var processedFiles []uploadFile
@@ -315,7 +315,7 @@ func prefetchBatch(candidateRawFiles []rawFile, cacheDir string, cacheFresh bool
 				continue
 			}
 
-			meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+			meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB, debugMode)
 			if err != nil {
 				if isWebDAVIOError(err) {
 					ch <- prefetchResult{err: err}
@@ -610,7 +610,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					if err != nil {
 						continue
 					}
-					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB, debugMode)
 					if err != nil {
 						continue
 					}
@@ -724,7 +724,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					if err != nil {
 						continue
 					}
-					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+					meta, err := processMedia(raw.path, info, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB, debugMode)
 					if err != nil {
 						continue
 					}
@@ -903,7 +903,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			}
 			candidateRawFiles := rawFiles[currentIndex:endIndex]
 			currentIndex = endIndex
-			nextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+			nextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB, debugMode)
 		}
 
 		for nextBatchChan != nil {
@@ -922,7 +922,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				}
 				candidateRawFiles := rawFiles[currentIndex:endIndex]
 				currentIndex = endIndex
-				currentNextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB)
+				currentNextBatchChan = prefetchBatch(candidateRawFiles, cacheDir, cacheFresh, transcode, forceUp, thumbMinSizeMB, debugMode)
 			}
 			nextBatchChan = currentNextBatchChan
 
@@ -1440,7 +1440,7 @@ func updateCacheStatus(cacheDir string, sha1Val string, status string) {
 	}
 }
 
-func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int) (MediaMetadata, error) {
+func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh bool, transcode bool, forceUp bool, thumbMinSizeMB int, debugMode string) (MediaMetadata, error) {
 	createdTime := getBirthTime(info)
 	sha1Val := calculateSHA1(info.Name(), createdTime, info.ModTime(), info.Size())
 	jsonPath := filepath.Join(cacheDir, sha1Val+".json")
@@ -1591,107 +1591,112 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 
 		// B. 如果不是缓存好的 h264 视频，且需要转码，则触发转码
 		if !useCachedH264 && needTranscode(meta.FilePath, ext, meta) {
-			if _, err := os.Stat(orgPath); err != nil {
-				fmt.Printf("📦 正在复制源文件至缓存目录以备转码: %s\n", meta.FileName)
-				if err := copyFile(filePath, orgPath); err != nil {
-					return meta, fmt.Errorf("复制源视频失败: %w", err)
+			if debugMode != "" {
+				// 💡 调试模式优化：只记录 TranPath，不要去跑任何下载与压制命令
+				meta.TranPath = filepath.Join(cacheDir, sha1Val+"_h264.mp4")
+			} else {
+				if _, err := os.Stat(orgPath); err != nil {
+					fmt.Printf("📦 正在复制源文件至缓存目录以备转码: %s\n", meta.FileName)
+					if err := copyFile(filePath, orgPath); err != nil {
+						return meta, fmt.Errorf("复制源视频失败: %w", err)
+					}
 				}
-			}
 
-			doTranscode := transcode
-			if !doTranscode {
-				doTranscode = askForTranscode(meta.FileName)
-			}
+				doTranscode := transcode
+				if !doTranscode {
+					doTranscode = askForTranscode(meta.FileName)
+				}
 
-			if doTranscode {
-				encoder := getBestH264Encoder()
-				fmt.Printf("⏳ 正在转码视频为标准 H264 MP4 (编码器: %s): %s ...\n", encoder, meta.FileName)
-				args := []string{"-y", "-i", orgPath, "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", transcodingPath}
+				if doTranscode {
+					encoder := getBestH264Encoder()
+					fmt.Printf("⏳ 正在转码视频为标准 H264 MP4 (编码器: %s): %s ...\n", encoder, meta.FileName)
+					args := []string{"-y", "-i", orgPath, "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", transcodingPath}
 
-				fmt.Printf("ℹ️  运行转码命令: ffmpeg %s\n", strings.Join(args, " "))
-
-				cmdTrans := exec.Command("ffmpeg", args...)
-				errTrans := cmdTrans.Run()
-				if errTrans != nil && encoder != "libx264" {
-					fmt.Printf("⚠️  硬件加速编码器 '%s' 转码失败（可能由于缺乏硬件或驱动支持）: %v\n", encoder, errTrans)
-					fmt.Println("🔄 正在尝试自动降级到 CPU 软件编码器 (libx264) 重新转码...")
-					encoder = "libx264"
-					args = []string{"-y", "-i", orgPath, "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", transcodingPath}
 					fmt.Printf("ℹ️  运行转码命令: ffmpeg %s\n", strings.Join(args, " "))
-					cmdTrans = exec.Command("ffmpeg", args...)
-					errTrans = cmdTrans.Run()
-				}
 
-				if errTrans == nil {
-					_ = os.Rename(transcodingPath, h264Path)
-					_ = os.Remove(orgPath)
-
-					fmt.Printf("✅ 视频转码成功: %s\n", meta.FileName)
-
-					meta.FilePath = h264Path
-					if h264Info, err := os.Stat(h264Path); err == nil {
-						meta.FileSize = h264Info.Size()
+					cmdTrans := exec.Command("ffmpeg", args...)
+					errTrans := cmdTrans.Run()
+					if errTrans != nil && encoder != "libx264" {
+						fmt.Printf("⚠️  硬件加速编码器 '%s' 转码失败（可能由于缺乏硬件或驱动支持）: %v\n", encoder, errTrans)
+						fmt.Println("🔄 正在尝试自动降级到 CPU 软件编码器 (libx264) 重新转码...")
+						encoder = "libx264"
+						args = []string{"-y", "-i", orgPath, "-c:v", encoder, "-pix_fmt", "yuv420p", "-c:a", "aac", transcodingPath}
+						fmt.Printf("ℹ️  运行转码命令: ffmpeg %s\n", strings.Join(args, " "))
+						cmdTrans = exec.Command("ffmpeg", args...)
+						errTrans = cmdTrans.Run()
 					}
 
-					cmdProbe := exec.Command("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", h264Path)
-					outputProbe, errProbe := cmdProbe.Output()
-					if errProbe == nil {
-						var data FFProbeResult
-						if err := json.Unmarshal(outputProbe, &data); err == nil {
-							for _, stream := range data.Streams {
-								if stream.CodecType == "video" {
-									// 检查视频流的旋转角度
-									rotation := 0
-									for _, sd := range stream.SideDataList {
-										if strings.EqualFold(sd.SideDataType, "Display Matrix") {
-											rotation = sd.Rotation
-										}
-									}
-									if rotation == 0 && stream.Tags.Rotate != "" {
-										var rot int
-										if _, err := fmt.Sscanf(stream.Tags.Rotate, "%d", &rot); err == nil {
-											rotation = rot
-										}
-									}
+					if errTrans == nil {
+						_ = os.Rename(transcodingPath, h264Path)
+						_ = os.Remove(orgPath)
 
-									absRot := rotation
-									if absRot < 0 {
-										absRot = -absRot
-									}
-									// 如果旋转了 90 或 270 度，则物理展示的宽高在提交给 TG 时需要翻转
-									if absRot == 90 || absRot == 270 {
-										meta.Width = stream.Height
-										meta.Height = stream.Width
-									} else {
-										meta.Width = stream.Width
-										meta.Height = stream.Height
-									}
+						fmt.Printf("✅ 视频转码成功: %s\n", meta.FileName)
 
-									meta.VideoCodec = stream.CodecName
-									if stream.Duration != "" {
-										var dur float64
-										fmt.Sscanf(stream.Duration, "%f", &dur)
-										meta.Duration = dur
+						meta.FilePath = h264Path
+						if h264Info, err := os.Stat(h264Path); err == nil {
+							meta.FileSize = h264Info.Size()
+						}
+
+						cmdProbe := exec.Command("ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", h264Path)
+						outputProbe, errProbe := cmdProbe.Output()
+						if errProbe == nil {
+							var data FFProbeResult
+							if err := json.Unmarshal(outputProbe, &data); err == nil {
+								for _, stream := range data.Streams {
+									if stream.CodecType == "video" {
+										// 检查视频流的旋转角度
+										rotation := 0
+										for _, sd := range stream.SideDataList {
+											if strings.EqualFold(sd.SideDataType, "Display Matrix") {
+												rotation = sd.Rotation
+											}
+										}
+										if rotation == 0 && stream.Tags.Rotate != "" {
+											var rot int
+											if _, err := fmt.Sscanf(stream.Tags.Rotate, "%d", &rot); err == nil {
+												rotation = rot
+											}
+										}
+
+										absRot := rotation
+										if absRot < 0 {
+											absRot = -absRot
+										}
+										// 如果旋转了 90 或 270 度，则物理展示的宽高在提交给 TG 时需要翻转
+										if absRot == 90 || absRot == 270 {
+											meta.Width = stream.Height
+											meta.Height = stream.Width
+										} else {
+											meta.Width = stream.Width
+											meta.Height = stream.Height
+										}
+
+										meta.VideoCodec = stream.CodecName
+										if stream.Duration != "" {
+											var dur float64
+											fmt.Sscanf(stream.Duration, "%f", &dur)
+											meta.Duration = dur
+										}
+									} else if stream.CodecType == "audio" {
+										meta.AudioCodec = stream.CodecName
 									}
-								} else if stream.CodecType == "audio" {
-									meta.AudioCodec = stream.CodecName
 								}
 							}
 						}
-					}
-					if meta.Width > 0 && meta.Height > 0 {
-						meta.AspectRatio = getAspectRatio(meta.Width, meta.Height)
+						if meta.Width > 0 && meta.Height > 0 {
+							meta.AspectRatio = getAspectRatio(meta.Width, meta.Height)
+						}
+					} else {
+						_ = os.Remove(transcodingPath)
+						_ = os.Remove(orgPath)
+						meta.FileType = "other"
+						return meta, fmt.Errorf("视频转码命令执行失败")
 					}
 				} else {
-					_ = os.Remove(transcodingPath)
 					_ = os.Remove(orgPath)
 					meta.FileType = "other"
-					return meta, fmt.Errorf("视频转码命令执行失败")
+					return meta, nil
 				}
-			} else {
-				_ = os.Remove(orgPath)
-				meta.FileType = "other"
-				return meta, nil
 			}
 		}
 
@@ -1772,32 +1777,37 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 
 		if needTran {
 			tranPath := filepath.Join(cacheDir, sha1Val+"_tran.jpg")
-			var filter []string
-
-			// 比例裁剪 (20:1 限制)
-			if ratio > 20.0 {
-				filter = append(filter, fmt.Sprintf("crop=%.0f:ih", h*20.0))
-				w = h * 20.0
-			} else if ratio < 0.05 {
-				filter = append(filter, fmt.Sprintf("crop=iw:%.0f", w*20.0))
-				h = w * 20.0
-			}
-
-			// 像素等比缩放
-			if w+h > 9900.0 {
-				factor := 9900.0 / (w + h)
-				filter = append(filter, fmt.Sprintf("scale=%.0f:%.0f", w*factor, h*factor))
-			}
-
-			args := []string{"-y", "-i", filePath}
-			if len(filter) > 0 {
-				args = append(args, "-vf", strings.Join(filter, ","))
-			}
-			args = append(args, "-q:v", "5", tranPath)
-
-			cmdTran := exec.Command("ffmpeg", args...)
-			if err := cmdTran.Run(); err == nil {
+			if debugMode != "" {
+				// 💡 调试模式优化：只记录 TranPath，不要去跑任何 ffmpeg 动作
 				meta.TranPath = tranPath
+			} else {
+				var filter []string
+
+				// 比例裁剪 (20:1 限制)
+				if ratio > 20.0 {
+					filter = append(filter, fmt.Sprintf("crop=%.0f:ih", h*20.0))
+					w = h * 20.0
+				} else if ratio < 0.05 {
+					filter = append(filter, fmt.Sprintf("crop=iw:%.0f", w*20.0))
+					h = w * 20.0
+				}
+
+				// 像素等比缩放
+				if w+h > 9900.0 {
+					factor := 9900.0 / (w + h)
+					filter = append(filter, fmt.Sprintf("scale=%.0f:%.0f", w*factor, h*factor))
+				}
+
+				args := []string{"-y", "-i", filePath}
+				if len(filter) > 0 {
+					args = append(args, "-vf", strings.Join(filter, ","))
+				}
+				args = append(args, "-q:v", "5", tranPath)
+
+				cmdTran := exec.Command("ffmpeg", args...)
+				if err := cmdTran.Run(); err == nil {
+					meta.TranPath = tranPath
+				}
 			}
 		}
 	}
