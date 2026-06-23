@@ -1591,7 +1591,8 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 		}
 
 		// B. 如果不是缓存好的 h264 视频，且需要转码，则触发转码
-		if !useCachedH264 && needTranscode(meta.FilePath, ext, meta) {
+		need, reasons := needTranscode(meta.FilePath, ext, meta)
+		if !useCachedH264 && need {
 			if debugMode != "" {
 				// 💡 调试模式优化：只记录 TranPath，不要去跑任何下载与压制命令
 				meta.TranPath = filepath.Join(cacheDir, sha1Val+"_h264.mp4")
@@ -1605,7 +1606,7 @@ func processMedia(filePath string, info os.FileInfo, cacheDir string, cacheFresh
 
 				doTranscode := transcode
 				if !doTranscode {
-					doTranscode = askForTranscode(meta.FileName)
+					doTranscode = askForTranscode(meta, ext, reasons)
 				}
 
 				if doTranscode {
@@ -1895,33 +1896,66 @@ func getBestH264Encoder() string {
 	return "libx264"
 }
 
-func needTranscode(filePath string, ext string, meta MediaMetadata) bool {
+func needTranscode(filePath string, ext string, meta MediaMetadata) (bool, []string) {
+	var reasons []string
+
 	// 1. 如果不是 mp4 且不是 mov，必转
 	if ext != ".mp4" && ext != ".mov" {
-		return true
+		reasons = append(reasons, fmt.Sprintf("容器格式不支持 (当前为: %s，仅支持 MP4/MOV)", ext))
 	}
 	// 2. 如果视频编码不是 h264 且不是 h265，必转
 	vCodec := strings.ToLower(meta.VideoCodec)
 	if vCodec != "h264" && vCodec != "h265" && vCodec != "hevc" {
-		return true
+		reasons = append(reasons, fmt.Sprintf("视频编码不支持 (当前为: %s，仅支持 H264/H265/HEVC)", meta.VideoCodec))
 	}
 	// 3. 如果音频编码存在但不是 aac，且不是苹果常见的免转码音频格式（针对 mov 容器豁免），必转
 	aCodec := strings.ToLower(meta.AudioCodec)
 	if aCodec != "" && aCodec != "aac" {
+		isAppleExempt := false
 		if ext == ".mov" {
 			switch aCodec {
 			case "pcm_s16le", "pcm_s24le", "alac", "lpcm":
-				// 苹果设备原生常见的高质量音轨编码，免转码直传
-				return false
+				isAppleExempt = true
 			}
 		}
-		return true
+		if !isAppleExempt {
+			reasons = append(reasons, fmt.Sprintf("音频编码不支持 (当前为: %s，仅支持 AAC)", meta.AudioCodec))
+		}
 	}
-	return false
+
+	return len(reasons) > 0, reasons
 }
 
-func askForTranscode(fileName string) bool {
-	fmt.Printf("\n⚠️  视频文件 '%s' 编码格式不符合 Telegram 播放规范，是否需要转码为 H264 MP4 视频？[y/N] (5秒内无输入将自动跳过该文件): ", fileName)
+func askForTranscode(meta MediaMetadata, ext string, reasons []string) bool {
+	vCodec := meta.VideoCodec
+	if vCodec == "" {
+		vCodec = "未知"
+	}
+	aCodec := meta.AudioCodec
+	if aCodec == "" {
+		aCodec = "无音轨/未知"
+	}
+	vBitrate := meta.VideoBitrate
+	if vBitrate == "" {
+		vBitrate = "未知"
+	}
+	aBitrate := meta.AudioBitrate
+	if aBitrate == "" {
+		aBitrate = "未知"
+	}
+	resStr := "未知"
+	if meta.Width > 0 && meta.Height > 0 {
+		resStr = fmt.Sprintf("%dx%d", meta.Width, meta.Height)
+	}
+
+	fmt.Printf("\n⚠️  检测到视频文件属性:\n")
+	fmt.Printf("   ├─ 文件名称: %s\n", meta.FileName)
+	fmt.Printf("   ├─ 封装格式: %s\n", ext)
+	fmt.Printf("   ├─ 画面尺寸: %s (比例: %s)\n", resStr, meta.AspectRatio)
+	fmt.Printf("   ├─ 视频编码: %s (码率: %s)\n", vCodec, vBitrate)
+	fmt.Printf("   └─ 音频编码: %s (码率: %s)\n", aCodec, aBitrate)
+	fmt.Printf("❌ 不合规原因: %s\n", strings.Join(reasons, "、"))
+	fmt.Printf("❓ 是否需要自动将其转码为符合 Telegram 播放规范的 H264 MP4 视频？[y/N] (5秒内无输入将自动跳过该文件): ")
 
 	ch := make(chan string, 1)
 	go func() {
