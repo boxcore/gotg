@@ -38,8 +38,8 @@ type FFProbeResult struct {
 	} `json:"format"`
 }
 
-// CheckMediaMain 入口：判断传入的是文件还是目录
-func CheckMediaMain(targetPath string) error {
+// CheckMediaMain 入口：判断传入的是文件还是目录，支持递归模式
+func CheckMediaMain(targetPath string, recursive bool) error {
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
@@ -47,26 +47,62 @@ func CheckMediaMain(targetPath string) error {
 	}
 
 	if fileInfo.IsDir() {
-		fmt.Printf("📂 开始扫描媒体目录: %s (不检查子目录)\n\n", cleanPath)
-		entries, err := os.ReadDir(cleanPath)
-		if err != nil {
-			return fmt.Errorf("读取目录失败: %w", err)
-		}
-		for _, entry := range entries {
-			if entry.IsDir() {
-				continue // 不检查子目录
-			}
-			info, err := entry.Info()
+		if recursive {
+			fmt.Printf("📂 开始扫描媒体目录: %s (深度递归检查子目录, 最大 3 层)\n\n", cleanPath)
+			return scanAndCheckDir(cleanPath, 1)
+		} else {
+			fmt.Printf("📂 开始扫描媒体目录: %s (不检查子目录)\n\n", cleanPath)
+			entries, err := os.ReadDir(cleanPath)
 			if err != nil {
-				continue
+				return fmt.Errorf("读取目录失败: %w", err)
 			}
-			fullPath := filepath.Join(cleanPath, entry.Name())
-			analyzeFile(fullPath, info)
-			fmt.Println(strings.Repeat("-", 40))
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue // 不检查子目录
+				}
+				info, err := entry.Info()
+				if err != nil {
+					continue
+				}
+				fullPath := filepath.Join(cleanPath, entry.Name())
+				analyzeFile(fullPath, info)
+				fmt.Println(strings.Repeat("-", 40))
+			}
 		}
 	} else {
 		fmt.Printf("📄 开始扫描单文件: %s\n\n", cleanPath)
 		analyzeFile(cleanPath, fileInfo)
+	}
+	return nil
+}
+
+// 递归扫描并检测媒体，最大深度限制为 3 层
+func scanAndCheckDir(dirPath string, level int) error {
+	if level > 3 {
+		return nil
+	}
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		fullPath := filepath.Join(dirPath, entry.Name())
+		if entry.IsDir() {
+			if !strings.HasPrefix(entry.Name(), ".") {
+				if err := scanAndCheckDir(fullPath, level+1); err != nil {
+					return err
+				}
+			}
+		} else {
+			nameLower := strings.ToLower(entry.Name())
+			if !strings.HasPrefix(nameLower, ".") && isMediaFile(entry.Name()) {
+				info, err := entry.Info()
+				if err == nil {
+					analyzeFile(fullPath, info)
+					fmt.Println(strings.Repeat("-", 40))
+				}
+			}
+		}
 	}
 	return nil
 }

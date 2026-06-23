@@ -395,8 +395,8 @@ func getDisplayTitleBase(titleBase string) string {
 	return titleBase
 }
 
-// UploadDirectoryFiles 读取 targetPath 下的多层文件并上传到指定频道
-func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, notifyID string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, isTitleSpecified bool, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
+// UploadDirectoryFiles 读取 targetPath 下的多级文件并上传到指定频道
+func UploadDirectoryFiles(tokens []string, recursive bool, chatIDStr string, notifyID string, targetPath string, apiURL string, groupSize int, debugMode string, sortType string, cacheDir string, cacheFresh bool, sleepTime int, uploadTitle string, isTitleSpecified bool, uploadTag string, forceUp bool, transcode bool, thumbMinSizeMB int) error {
 	cleanPath := filepath.Clean(targetPath)
 	fileInfo, err := os.Stat(cleanPath)
 	if err != nil {
@@ -465,32 +465,8 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			},
 		}
 	} else {
-		// 1. 扫描 cleanPath 下直属的二级子目录
-		entries, err := os.ReadDir(cleanPath)
-		if err != nil {
-			if isWebDAVIOError(err) {
-				sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
-			}
-			return fmt.Errorf("读取目录失败: %w", err)
-		}
-
-		var secondLevelDirs []os.DirEntry
-		for _, entry := range entries {
-			if entry.IsDir() {
-				secondLevelDirs = append(secondLevelDirs, entry)
-			}
-		}
-
-		// 检查 cleanPath 目录下是否直接含有媒体文件
-		hasDirectMediaFiles := false
-		for _, entry := range entries {
-			if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && isMediaFile(entry.Name()) {
-				hasDirectMediaFiles = true
-				break
-			}
-		}
-
-		if len(secondLevelDirs) == 0 {
+		// 💡 根据 recursive 参数决定是否递归扫描子目录
+		if !recursive {
 			rootTitleBase := ""
 			switch titleRule {
 			case 1:
@@ -502,16 +478,39 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 			case 0:
 				rootTitleBase = ""
 			}
-			tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, rootTitleBase)
+			allDirTasks = []DirTask{
+				{
+					Path:      cleanPath,
+					TitleBase: rootTitleBase,
+				},
+			}
+		} else {
+			// 1. 扫描 cleanPath 下直属的二级子目录
+			entries, err := os.ReadDir(cleanPath)
 			if err != nil {
 				if isWebDAVIOError(err) {
 					sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
 				}
-				return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
+				return fmt.Errorf("读取目录失败: %w", err)
 			}
-			allDirTasks = append(allDirTasks, tasksForThisDir...)
-		} else {
-			if hasDirectMediaFiles {
+
+			var secondLevelDirs []os.DirEntry
+			for _, entry := range entries {
+				if entry.IsDir() {
+					secondLevelDirs = append(secondLevelDirs, entry)
+				}
+			}
+
+			// 检查 cleanPath 目录下是否直接含有媒体文件
+			hasDirectMediaFiles := false
+			for _, entry := range entries {
+				if !entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && isMediaFile(entry.Name()) {
+					hasDirectMediaFiles = true
+					break
+				}
+			}
+
+			if len(secondLevelDirs) == 0 {
 				rootTitleBase := ""
 				switch titleRule {
 				case 1:
@@ -523,50 +522,72 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				case 0:
 					rootTitleBase = ""
 				}
-				allDirTasks = append(allDirTasks, DirTask{
-					Path:      cleanPath,
-					TitleBase: rootTitleBase,
-				})
-			}
-
-			// 为每个二级子目录计算 TitleBase
-			var secondLevelBaseTitles []string
-			for idx, d := range secondLevelDirs {
-				titleForThisDir := ""
-				switch titleRule {
-				case 1:
-					titleForThisDir = d.Name()
-				case 2:
-					titleForThisDir = "__use_file_name__"
-				case 3:
-					if len(secondLevelDirs) == 1 {
-						titleForThisDir = customInputTitle
-					} else {
-						if idx == 0 {
-							titleForThisDir = customInputTitle
-						} else {
-							titleForThisDir = fmt.Sprintf("%s_%d", customInputTitle, idx+1)
-						}
-					}
-				case 0:
-					titleForThisDir = ""
-				}
-				secondLevelBaseTitles = append(secondLevelBaseTitles, titleForThisDir)
-			}
-
-			// 极速探测各二级目录及子目录下的结构树，并生成任务
-			for idx, d := range secondLevelDirs {
-				subDirPath := filepath.Join(cleanPath, d.Name())
-				baseTitleForThisDir := secondLevelBaseTitles[idx]
-
-				tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
+				tasksForThisDir, err := scanAndCollectDirPaths(cleanPath, rootTitleBase)
 				if err != nil {
 					if isWebDAVIOError(err) {
 						sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
 					}
-					return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
+					return fmt.Errorf("读取目录 '%s' 的结构失败: %w", cleanPath, err)
 				}
 				allDirTasks = append(allDirTasks, tasksForThisDir...)
+			} else {
+				if hasDirectMediaFiles {
+					rootTitleBase := ""
+					switch titleRule {
+					case 1:
+						rootTitleBase = filepath.Base(cleanPath)
+					case 2:
+						rootTitleBase = "__use_file_name__"
+					case 3:
+						rootTitleBase = customInputTitle
+					case 0:
+						rootTitleBase = ""
+					}
+					allDirTasks = append(allDirTasks, DirTask{
+						Path:      cleanPath,
+						TitleBase: rootTitleBase,
+					})
+				}
+
+				// 为每个二级子目录计算 TitleBase
+				var secondLevelBaseTitles []string
+				for idx, d := range secondLevelDirs {
+					titleForThisDir := ""
+					switch titleRule {
+					case 1:
+						titleForThisDir = d.Name()
+					case 2:
+						titleForThisDir = "__use_file_name__"
+					case 3:
+						if len(secondLevelDirs) == 1 {
+							titleForThisDir = customInputTitle
+						} else {
+							if idx == 0 {
+								titleForThisDir = customInputTitle
+							} else {
+								titleForThisDir = fmt.Sprintf("%s_%d", customInputTitle, idx+1)
+							}
+						}
+					case 0:
+						titleForThisDir = ""
+					}
+					secondLevelBaseTitles = append(secondLevelBaseTitles, titleForThisDir)
+				}
+
+				// 极速探测各二级目录及子目录下的结构树，并生成任务
+				for idx, d := range secondLevelDirs {
+					subDirPath := filepath.Join(cleanPath, d.Name())
+					baseTitleForThisDir := secondLevelBaseTitles[idx]
+
+					tasksForThisDir, err := scanAndCollectDirPaths(subDirPath, baseTitleForThisDir)
+					if err != nil {
+						if isWebDAVIOError(err) {
+							sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+						}
+						return fmt.Errorf("读取二级子目录 '%s' 的结构失败: %w", d.Name(), err)
+					}
+					allDirTasks = append(allDirTasks, tasksForThisDir...)
+				}
 			}
 		}
 	}
@@ -839,7 +860,7 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					fmt.Println(strings.Join(filesFields, " \\\n"))
 					fmt.Println("```")
 
-					if useRRotation && len(tokens) > 1 {
+					if recursive && len(tokens) > 1 {
 						tokenIdx = (tokenIdx + 1) % len(tokens)
 					}
 
@@ -1301,13 +1322,13 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 					totalSuccessCount += len(batch)
 				}
 
-				if useRRotation && len(bots) > 1 {
+				if recursive && len(bots) > 1 {
 					tokenIdx = (tokenIdx + 1) % len(bots)
 					fmt.Printf("🔄 轮询模式：切换到下一个 Bot (Token: %s)\n", maskToken(tokens[tokenIdx]))
 				}
 
 				isLastBatchOverall := (currentIndex >= totalRaw && subBatchIdx == totalBatchesForGroup-1)
-				if !isLastBatchOverall || (useRRotation && len(bots) > 1) {
+				if !isLastBatchOverall || (recursive && len(bots) > 1) {
 					fmt.Printf("💤 已完成该媒体组处理，根据设置休眠 %d 秒以防止 API 频控/风控...\n", sleepTime)
 					time.Sleep(time.Duration(sleepTime) * time.Second)
 				}

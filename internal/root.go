@@ -34,7 +34,7 @@ var (
 	uploadTag   string
 	forceUp      bool
 	transcode    bool
-	useRRotation bool
+	recursiveMode bool
 	thumbMinSizeMB int
 	notifyID    string
 )
@@ -176,7 +176,7 @@ var RootCmd = &cobra.Command{
 				}
 
 				// 调试模式不需要常规强校验 TOKEN 和 CHAT_ID
-				if err := UploadDirectoryFiles(tgTokens, useRRotation, tgChatID, notifyID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
+				if err := UploadDirectoryFiles(tgTokens, recursiveMode, tgChatID, notifyID, args[0], apiURL, groupSize, debugMode, sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 调试输出失败: %v\n", err)
 				}
 				return
@@ -198,7 +198,7 @@ var RootCmd = &cobra.Command{
 				os.Exit(1)
 			}
 
-			if useRRotation {
+			if recursiveMode {
 				if len(activeTokens) == 1 {
 					fmt.Println("⚠️  警告: 使用 -r 参数建议部署多个 token。您目前只配置了一个 token，建议至少设置 3 个以跳过 Telegram 频控/风控！")
 					fmt.Println("⏳ 请在 5 秒内按回车 [Enter] 确认继续执行，未确认将自动退出...")
@@ -219,7 +219,7 @@ var RootCmd = &cobra.Command{
 					}
 				}
 
-				fmt.Printf("📂 开始多 Bot 轮询上传 (共 %d 个 Bot)...\n", len(activeTokens))
+				fmt.Printf("📂 开始多 Bot 轮询递归上传 (共 %d 个 Bot)...\n", len(activeTokens))
 				if err := UploadDirectoryFiles(activeTokens, true, chatID, notifyID, args[0], apiURL, groupSize, "", sortType, expandedCacheDir, cacheFresh, sleepTime, uploadTitle, cmd.Flags().Changed("title"), uploadTag, forceUp, transcode, thumbMinSizeMB); err != nil {
 					fmt.Printf("❌ 轮询上传中断: %v\n", err)
 				}
@@ -239,7 +239,7 @@ var RootCmd = &cobra.Command{
 				fmt.Println("❌ 错误: 使用 -t=check_media 时，必须指定一个目标目录或文件路径！")
 				os.Exit(1)
 			}
-			if err := CheckMediaMain(args[0]); err != nil {
+			if err := CheckMediaMain(args[0], recursiveMode); err != nil {
 				fmt.Printf("❌ 媒体解析终止: %v\n", err)
 				os.Exit(1)
 			}
@@ -278,7 +278,7 @@ func init() {
 	RootCmd.Flags().StringVar(&uploadTag, "tag", "", "媒体标题的尾部标签，例如 '#tag1 #tag2'")
 	RootCmd.Flags().BoolVar(&forceUp, "force-up", false, "强制重新上传已成功上传的文件")
 	RootCmd.Flags().BoolVar(&transcode, "transcode", false, "强制转码不合规的视频文件而不需要确认")
-	RootCmd.Flags().BoolVarP(&useRRotation, "r-rotation", "r", false, "轮询使用多个 Token 上传各个媒体组")
+	RootCmd.Flags().BoolVarP(&recursiveMode, "recursive", "r", false, "递归扫描子目录（最多 3 层）。对于 up 上传任务，在递归模式下若配置了多个 Bot Token 也会自动启用多 Bot 负载轮询上传")
 	RootCmd.Flags().IntVar(&thumbMinSizeMB, "thumb-min-size", 2, "图片生成缩略图的最小体积阈值限制，默认是2（MB）")
 	RootCmd.Flags().StringVar(&notifyID, "notify-id", "", "任务完成后发送统计报告的目标 Telegram 用户 UID 或群组 Chat ID")
 
