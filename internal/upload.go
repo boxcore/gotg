@@ -37,6 +37,7 @@ type MediaMetadata struct {
 	UploadTime   time.Time `json:"upload_time,omitempty"`
 	MediaGroupID string    `json:"media_group_id,omitempty"`
 	FileID       string    `json:"file_id,omitempty"`
+	OrgPath      string    `json:"org_path,omitempty"`
 
 	// 视频特有
 	Duration     float64 `json:"duration,omitempty"` // 秒
@@ -956,6 +957,21 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 				bot := bots[tokenIdx]
 				token := tokens[tokenIdx]
 
+				limit := int64(50 * 1024 * 1024)
+				if apiURL != "" {
+					limit = 2000 * 1024 * 1024
+				}
+
+				// 在准备上传前，将需要从 WebDAV 下载的文件缓存到本地目录，支持超限风控限制
+				if err := downloadToCache(batch, cacheDir, limit); err != nil {
+					if isWebDAVIOError(err) {
+						sendAlertNotification(tokens, apiURL, notifyID, err.Error(), targetPath)
+						return fmt.Errorf("WebDAV 下载源文件失败 (WebDAV/IO 错误): %w", err)
+					}
+					// 否则如果是其他常规写入权限等错误，打印警告但尝试继续
+					fmt.Printf("⚠️ 缓存源文件失败: %v\n", err)
+				}
+
 				var totalBytes int64
 				for _, f := range batch {
 					totalBytes += f.size
@@ -1102,140 +1118,171 @@ func UploadDirectoryFiles(tokens []string, useRRotation bool, chatIDStr string, 
 						return fmt.Errorf("上传媒体组失败 (WebDAV/IO 错误): %w", err)
 					}
 
-					// 2. 如果是正常的 TG API 报错，等待 35 秒后发起重试
-					fmt.Printf("⚠️ 媒体组上传失败: %v。将在 35 秒后重新尝试上传...\n", err)
+					// 2. 如果是正常的 TG API 报错，等待 35 秒后拆分为 3 组重新上传
+					fmt.Printf("⚠️ 媒体组上传失败: %v。将在 35 秒后拆分为最多 3 组重新上传...\n", err)
 					time.Sleep(35 * time.Second)
 
-					uploadedBytes = 0 // 重置进度，以支持重试时绘制进度条
-
-					var retryOpenFiles []*os.File
-					var retryMediaList []telego.InputMedia
-					var retryOpenErr error
-
-					for mediaIdx, f := range batch {
-						uploadPath := f.path
-						if f.metadata.TranPath != "" {
-							uploadPath = f.metadata.TranPath
+					subBatches := splitIntoThree(batch)
+					for subIdx, subBatch := range subBatches {
+						subBatchTitle := batchTitle
+						if len(subBatches) > 1 {
+							subBatchTitle = fmt.Sprintf("%s-%d", batchTitle, subIdx+1)
 						}
 
-						caption := ""
-						if mediaIdx == 0 {
-							caption = batchTitle
+						var subOpenFiles []*os.File
+						var subMediaList []telego.InputMedia
+						var subOpenErr error
+
+						uploadedBytes = 0
+						var subTotalBytes int64
+						for _, f := range subBatch {
+							subTotalBytes += f.size
 						}
 
-						fileHandle, err := os.Open(uploadPath)
-						if err != nil {
-							retryOpenErr = err
-							break
-						}
-						retryOpenFiles = append(retryOpenFiles, fileHandle)
-
-						var reader telegoapi.NamedReader = fileHandle
-						if debugMode == "" {
-							reader = &ProgressNamedReader{
-								Reader: fileHandle,
-								name:   filepath.Base(uploadPath),
-								onRead: func(n int) {
-									mu.Lock()
-									uploadedBytes += int64(n)
-									currentFile = f.name
-									drawProgressBar(uploadedBytes, totalBytes, currentFile)
-									mu.Unlock()
-								},
+						for mediaIdx, f := range subBatch {
+							uploadPath := f.path
+							if f.metadata.TranPath != "" {
+								uploadPath = f.metadata.TranPath
 							}
-						}
 
-						if f.metadata.FileType == "video" {
-							doc := &telego.InputMediaVideo{
-								Type:              "video",
-								Media:             telego.InputFile{File: reader},
-								Width:             f.metadata.Width,
-								Height:            f.metadata.Height,
-								Duration:          int(f.metadata.Duration),
-								SupportsStreaming: true,
-								Caption:           caption,
+							caption := ""
+							if mediaIdx == 0 {
+								caption = subBatchTitle
 							}
-							if f.metadata.ThumbPath != "" {
-								thumbHandle, err := os.Open(f.metadata.ThumbPath)
-								if err == nil {
-									retryOpenFiles = append(retryOpenFiles, thumbHandle)
-									doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+
+							fileHandle, err := os.Open(uploadPath)
+							if err != nil {
+								subOpenErr = err
+								break
+							}
+							subOpenFiles = append(subOpenFiles, fileHandle)
+
+							var reader telegoapi.NamedReader = fileHandle
+							if debugMode == "" {
+								reader = &ProgressNamedReader{
+									Reader: fileHandle,
+									name:   filepath.Base(uploadPath),
+									onRead: func(n int) {
+										mu.Lock()
+										uploadedBytes += int64(n)
+										currentFile = f.name
+										drawProgressBar(uploadedBytes, subTotalBytes, currentFile)
+										mu.Unlock()
+									},
 								}
 							}
-							retryMediaList = append(retryMediaList, doc)
-						} else if f.metadata.FileType == "image" {
-							doc := &telego.InputMediaPhoto{
-								Type:    "photo",
-								Media:   telego.InputFile{File: reader},
-								Caption: caption,
-							}
-							retryMediaList = append(retryMediaList, doc)
-						} else {
-							doc := &telego.InputMediaDocument{
-								Type:    "document",
-								Media:   telego.InputFile{File: reader},
-								Caption: caption,
-							}
-							if f.metadata.ThumbPath != "" {
-								thumbHandle, err := os.Open(f.metadata.ThumbPath)
-								if err == nil {
-									retryOpenFiles = append(retryOpenFiles, thumbHandle)
-									doc.Thumbnail = &telego.InputFile{File: thumbHandle}
-								}
-							}
-							retryMediaList = append(retryMediaList, doc)
-						}
-					}
 
-					if retryOpenErr != nil {
-						for _, fh := range retryOpenFiles {
-							_ = fh.Close()
+							if f.metadata.FileType == "video" {
+								doc := &telego.InputMediaVideo{
+									Type:              "video",
+									Media:             telego.InputFile{File: reader},
+									Width:             f.metadata.Width,
+									Height:            f.metadata.Height,
+									Duration:          int(f.metadata.Duration),
+									SupportsStreaming: true,
+									Caption:           caption,
+								}
+								if f.metadata.ThumbPath != "" {
+									thumbHandle, err := os.Open(f.metadata.ThumbPath)
+									if err == nil {
+										subOpenFiles = append(subOpenFiles, thumbHandle)
+										doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+									}
+								}
+								subMediaList = append(subMediaList, doc)
+							} else if f.metadata.FileType == "image" {
+								doc := &telego.InputMediaPhoto{
+									Type:    "photo",
+									Media:   telego.InputFile{File: reader},
+									Caption: caption,
+								}
+								subMediaList = append(subMediaList, doc)
+							} else {
+								doc := &telego.InputMediaDocument{
+									Type:    "document",
+									Media:   telego.InputFile{File: reader},
+									Caption: caption,
+								}
+								if f.metadata.ThumbPath != "" {
+									thumbHandle, err := os.Open(f.metadata.ThumbPath)
+									if err == nil {
+										subOpenFiles = append(subOpenFiles, thumbHandle)
+										doc.Thumbnail = &telego.InputFile{File: thumbHandle}
+									}
+								}
+								subMediaList = append(subMediaList, doc)
+							}
 						}
-						if isWebDAVIOError(retryOpenErr) {
-							sendAlertNotification(tokens, apiURL, notifyID, retryOpenErr.Error(), targetPath)
-							return fmt.Errorf("读取文件失败 (WebDAV/IO 错误): %w", retryOpenErr)
+
+						if subOpenErr != nil {
+							for _, fh := range subOpenFiles {
+								_ = fh.Close()
+							}
+							if isWebDAVIOError(subOpenErr) {
+								sendAlertNotification(tokens, apiURL, notifyID, subOpenErr.Error(), targetPath)
+								return fmt.Errorf("读取文件失败 (WebDAV/IO 错误): %w", subOpenErr)
+							}
+							fmt.Printf("❌ 拆分组 %d/%d 准备失败 (无法打开文件): %v\n", subIdx+1, len(subBatches), subOpenErr)
+
+							for _, f := range subBatch {
+								updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
+							}
+							failedGroupsCount++
+							totalFailedCount += len(subBatch)
+							failedGroups = append(failedGroups, failedGroupInfo{
+								Title: subBatchTitle,
+								Files: getFileNames(subBatch),
+								Err:   "打开文件失败: " + subOpenErr.Error(),
+							})
+							continue
 						}
-						err = fmt.Errorf("重试时无法打开部分文件: %w", retryOpenErr)
-					} else {
-						fmt.Println("🔄 正在重新发起上传...")
-						var retryErr error
-						var messagesResult []telego.Message
-						messagesResult, retryErr = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
+
+						fmt.Printf("🔄 正在上传拆分组 %d/%d (标题: %s)...\n", subIdx+1, len(subBatches), subBatchTitle)
+						var subMessages []telego.Message
+						var subSendErr error
+						subMessages, subSendErr = bot.SendMediaGroup(context.Background(), &telego.SendMediaGroupParams{
 							ChatID: chatID,
-							Media:  retryMediaList,
+							Media:  subMediaList,
 						})
 
-						for _, fh := range retryOpenFiles {
+						for _, fh := range subOpenFiles {
 							_ = fh.Close()
 						}
 
-						if retryErr != nil && isWebDAVIOError(retryErr) {
-							sendAlertNotification(tokens, apiURL, notifyID, retryErr.Error(), targetPath)
-							return fmt.Errorf("上传媒体组失败 (WebDAV/IO 错误): %w", retryErr)
-						}
-						err = retryErr
-						if err == nil {
-							messages = messagesResult
-						}
-					}
-				}
+						if subSendErr != nil {
+							if isWebDAVIOError(subSendErr) {
+								sendAlertNotification(tokens, apiURL, notifyID, subSendErr.Error(), targetPath)
+								return fmt.Errorf("上传拆分组失败 (WebDAV/IO 错误): %w", subSendErr)
+							}
+							fmt.Printf("❌ 拆分组 %d/%d 上传失败: %v，已跳过该子组\n", subIdx+1, len(subBatches), subSendErr)
 
-				if err != nil {
-					fmt.Printf("❌ 媒体组重试上传依然失败: %v\n", err)
-					for _, f := range batch {
-						updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
+							for _, f := range subBatch {
+								updateCacheStatus(cacheDir, f.metadata.SHA1, "failed")
+							}
+							failedGroupsCount++
+							totalFailedCount += len(subBatch)
+							failedGroups = append(failedGroups, failedGroupInfo{
+								Title: subBatchTitle,
+								Files: getFileNames(subBatch),
+								Err:   subSendErr.Error(),
+							})
+						} else {
+							fmt.Printf("✅ 拆分组 %d/%d 上传成功 (%d 个文件)\n", subIdx+1, len(subBatches), len(subBatch))
+							count += len(subBatch)
+							for i, f := range subBatch {
+								mediaGroupID := ""
+								fileID := ""
+								if i < len(subMessages) {
+									mediaGroupID = subMessages[i].MediaGroupID
+									fileID = getFileIDFromMessage(subMessages[i])
+								}
+								updateCacheSuccess(cacheDir, f.metadata.SHA1, mediaGroupID, fileID)
+								cleanTranscodeFiles(cacheDir, f.metadata)
+							}
+							successGroupsCount++
+							totalSuccessCount += len(subBatch)
+						}
 					}
-					failedGroupsCount++
-					var fileNames []string
-					for _, f := range batch {
-						fileNames = append(fileNames, f.name)
-						totalFailedCount++
-					}
-					failedGroups = append(failedGroups, failedGroupInfo{
-						Title: batchTitle,
-						Files: fileNames,
-						Err:   err.Error(),
-					})
 				} else {
 					fmt.Printf("✅ 媒体组上传成功 (%d 个文件)\n", len(batch))
 					count += len(batch)
@@ -2194,8 +2241,137 @@ func updateCacheSuccess(cacheDir string, sha1Val string, mediaGroupID string, fi
 	meta.MediaGroupID = mediaGroupID
 	meta.FileID = fileID
 
+	// 物理删除缓存的源文件
+	if meta.OrgPath != "" {
+		_ = os.Remove(meta.OrgPath)
+		meta.OrgPath = ""
+	}
+
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
 	if err == nil {
 		_ = os.WriteFile(jsonPath, metaJSON, 0644)
 	}
+}
+
+func copyFileToCache(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, in)
+	if err != nil {
+		return err
+	}
+	return out.Sync()
+}
+
+func getFileNames(files []uploadFile) []string {
+	var names []string
+	for _, f := range files {
+		names = append(names, f.name)
+	}
+	return names
+}
+
+func splitIntoThree(batch []uploadFile) [][]uploadFile {
+	n := len(batch)
+	if n == 0 {
+		return nil
+	}
+	if n <= 2 {
+		var res [][]uploadFile
+		for _, f := range batch {
+			res = append(res, []uploadFile{f})
+		}
+		return res
+	}
+
+	baseSize := n / 3
+	rem := n % 3
+
+	var res [][]uploadFile
+	start := 0
+	for i := 0; i < 3; i++ {
+		size := baseSize
+		if i < rem {
+			size++
+		}
+		if size <= 0 {
+			continue
+		}
+		end := start + size
+		if end > n {
+			end = n
+		}
+		res = append(res, batch[start:end])
+		start = end
+	}
+	return res
+}
+
+func updateCacheOrgPath(cacheDir string, sha1Val string, orgPath string) {
+	jsonPath := filepath.Join(cacheDir, sha1Val+".json")
+	cachedData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return
+	}
+	var meta MediaMetadata
+	if err := json.Unmarshal(cachedData, &meta); err != nil {
+		return
+	}
+	meta.OrgPath = orgPath
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(jsonPath, metaJSON, 0644)
+	}
+}
+
+func downloadToCache(batch []uploadFile, cacheDir string, limit int64) error {
+	for i := range batch {
+		f := &batch[i]
+
+		// 1. 如果该文件有转码后的 TranPath，因为 TranPath 已经是在本地缓存目录的临时文件，所以不需要拷贝源文件
+		if f.metadata.TranPath != "" {
+			continue
+		}
+
+		// 2. 检查 2G 超限风控体积
+		if f.size > limit {
+			continue
+		}
+
+		targetOrgPath := filepath.Join(cacheDir, f.metadata.SHA1+"_org"+filepath.Ext(f.name))
+
+		// 3. 如果已经在缓存目录，则不需要复制
+		if filepath.Clean(f.path) == filepath.Clean(targetOrgPath) {
+			continue
+		}
+
+		// 4. 检查是否已经下载缓存过
+		if _, err := os.Stat(targetOrgPath); err == nil {
+			f.path = targetOrgPath
+			continue
+		}
+
+		// 5. 复制文件到本地缓存
+		fmt.Printf("📥 [WebDAV 缓存] 正在下载源文件到本地缓存: %s...\n", f.name)
+		err := copyFileToCache(f.path, targetOrgPath)
+		if err != nil {
+			_ = os.Remove(targetOrgPath)
+			return fmt.Errorf("下载 WebDAV 源文件失败: %w", err)
+		}
+
+		// 6. 更新 json 缓存中的 org_path 字段
+		updateCacheOrgPath(cacheDir, f.metadata.SHA1, targetOrgPath)
+		f.path = targetOrgPath
+	}
+	return nil
 }
